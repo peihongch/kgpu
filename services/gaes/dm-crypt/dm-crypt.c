@@ -596,9 +596,11 @@ static int crypt_iv_lmk_gen(struct crypt_config *cc, u8 *iv,
 	int r = 0;
 
 	if (bio_data_dir(dmreq->ctx->bio_in) == WRITE) {
-		src = kmap_atomic(sg_page(&dmreq->sg_in), KM_USER0);
+		// src = kmap_atomic(sg_page(&dmreq->sg_in), KM_USER0);
+		src = kmap_atomic(sg_page(&dmreq->sg_in));
 		r = crypt_iv_lmk_one(cc, iv, dmreq, src + dmreq->sg_in.offset);
-		kunmap_atomic(src, KM_USER0);
+		// kunmap_atomic(src, KM_USER0);
+		kunmap_atomic(src);
 	} else
 		memset(iv, 0, cc->iv_size);
 
@@ -614,14 +616,16 @@ static int crypt_iv_lmk_post(struct crypt_config *cc, u8 *iv,
 	if (bio_data_dir(dmreq->ctx->bio_in) == WRITE)
 		return 0;
 
-	dst = kmap_atomic(sg_page(&dmreq->sg_out), KM_USER0);
+	// dst = kmap_atomic(sg_page(&dmreq->sg_out), KM_USER0);
+	dst = kmap_atomic(sg_page(&dmreq->sg_out));
 	r = crypt_iv_lmk_one(cc, iv, dmreq, dst + dmreq->sg_out.offset);
 
 	/* Tweak the first block of plaintext sector */
 	if (!r)
 		crypto_xor(dst + dmreq->sg_out.offset, iv, cc->iv_size);
 
-	kunmap_atomic(dst, KM_USER0);
+	// kunmap_atomic(dst, KM_USER0);
+	kunmap_atomic(dst);
 	return r;
 }
 
@@ -895,13 +899,13 @@ static int crypt_convert(struct crypt_config *cc,
 	return 0;
 }
 
-static void dm_crypt_bio_destructor(struct bio *bio)
-{
-	struct dm_crypt_io *io = bio->bi_private;
-	struct crypt_config *cc = io->target->private;
+// static void dm_crypt_bio_destructor(struct bio *bio)
+// {
+// 	struct dm_crypt_io *io = bio->bi_private;
+// 	struct crypt_config *cc = io->target->private;
 
-	bio_free(bio, cc->bs);
-}
+// 	bio_free(bio, cc->bs);
+// }
 
 /*
  * Generate a new unfragmented bio with the given size
@@ -1073,7 +1077,7 @@ static void clone_init(struct dm_crypt_io *io, struct bio *clone)
 	clone->bi_end_io  = crypt_endio;
 	clone->bi_bdev    = cc->dev->bdev;
 	clone->bi_rw      = io->base_bio->bi_rw;
-	clone->bi_destructor = dm_crypt_bio_destructor;
+	// clone->bi_destructor = dm_crypt_bio_destructor;
 }
 
 /*static void kcryptd_unplug(struct crypt_config *cc)
@@ -1772,7 +1776,8 @@ static int crypt_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		goto bad;
 	}
 
-	ti->num_flush_requests = 1;
+	// ti->num_flush_requests = 1;
+	ti->num_flush_bios = 1;
 	return 0;
 
 bad:

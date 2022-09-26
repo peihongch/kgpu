@@ -1,4 +1,5 @@
-SUBDIRS = gaes test raid6
+SUBDIRS = gaes test 
+# SUBDIRS = gaes test raid6
 
 all: $(SUBDIRS)
 
