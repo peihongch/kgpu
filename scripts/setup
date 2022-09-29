@@ -1,0 +1,6 @@
+#!/bin/sh
+
+insmod ./dm-crypt.ko
+
+# Create a crypt device using dmsetup
+dmsetup create crypt1 --table "0 `blockdev --getsz $1` crypt aes-gaes_xts-plain babebabebabebabebabebabebabebabebabebabebabebabebabebabebabebabe 0 $1 0"

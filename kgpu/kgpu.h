@@ -87,8 +87,8 @@ struct kgpu_service;
 
 struct kgpu_service_request {
     int id;
-    void *hin, *hout, *hdata;
-    void *din, *dout, *ddata;
+    void *hin, *hout, *hdata;   // host
+    void *din, *dout, *ddata;   // device
     unsigned long insize, outsize, datasize;
     int errcode;
     struct kgpu_service *s;
