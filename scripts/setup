@@ -1,5 +1,6 @@
 #!/bin/sh
 
+modprobe dm_mod
 insmod ./dm-crypt.ko
 
 # Create a crypt device using dmsetup

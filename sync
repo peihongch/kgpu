@@ -1,0 +1,8 @@
+#!/bin/bash
+
+src=/root/peihongchen/GPUStore
+user=root
+host=192.168.122.204
+dst=/root/workspace/
+
+/usr/bin/rsync -r -vzrtopg --delete --progress $src $user@$host:$dst

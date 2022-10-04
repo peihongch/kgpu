@@ -556,7 +556,8 @@ ssize_t kgpu_read(struct file* filp, char __user* buf, size_t c, loff_t* fpos) {
         struct kgpu_ku_request kureq;
         fill_ku_request(&kureq, item->r);
 
-        memcpy(buf, &kureq, sizeof(struct kgpu_ku_request));
+        // FIX BUG: memcpy(buf, &kureq, sizeof(struct kgpu_ku_request));
+        copy_to_user(buf, &kureq, sizeof(struct kgpu_ku_request));
         ret = c;
     }
 
@@ -590,7 +591,8 @@ ssize_t kgpu_write(struct file* filp,
     else {
         realcount = sizeof(struct kgpu_ku_response);
 
-        memcpy /*copy_from_user*/ (&kuresp, buf, realcount);
+        // FIX BUG: memcpy /*copy_from_user*/ (&kuresp, buf, realcount);
+        copy_from_user(&kuresp, buf, realcount);
 
         item = find_request(kuresp.id, 1);
         if (!item) {

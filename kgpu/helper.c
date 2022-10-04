@@ -205,6 +205,11 @@ static int kh_get_next_service_request(void) {
                 abort();
             }
         } else {
+            printf(
+                "id=%d, service_name=%s, insize=%lu, outsize=%lu, "
+                "datasize=%lu\n",
+                kureq.id, kureq.service_name, kureq.insize, kureq.outsize,
+                kureq.datasize);
             kh_init_service_request(sreq, &kureq);
             return 0;
         }
