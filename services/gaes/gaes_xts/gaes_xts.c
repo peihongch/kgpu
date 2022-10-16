@@ -191,28 +191,32 @@ static int cpu_crypt(struct blkcipher_desc* d,
     struct sinfo s = {.tfm = crypto_cipher_tfm(ctx->child), .fn = fn};
     u8* wsrc;
     u8* wdst;
+    sector_t tweak;
 
     err = blkcipher_walk_virt(d, w);
     if (!w->nbytes)
         return err;
 
     s.t = (be128*)w->iv;
-    avail = w->nbytes;
-
-    wsrc = w->src.virt.addr;
-    wdst = w->dst.virt.addr;
-
-    /* calculate first value of T */
-    tw(crypto_cipher_tfm(ctx->tweak), w->iv, w->iv);
-
-    goto first;
+    tweak = le64_to_cpu(*(__le64*)(w->iv));
 
     for (;;) {
-        do {
-            gf128mul_x_ble(s.t, s.t);
+        avail = w->nbytes;
 
-        first:
+        wsrc = w->src.virt.addr;
+        wdst = w->dst.virt.addr;
+
+        do {
+            // use sector num as tweak and one tweak per sector (512 bytes)
+            if (unlikely(avail % 512 == 0)) {
+                *((__le64*)(w->iv)) = cpu_to_le64(tweak++);
+                *((__le64*)(w->iv + 8)) = cpu_to_le64(0);
+                /* calculate first value of T */
+                tw(crypto_cipher_tfm(ctx->tweak), w->iv, w->iv);
+            }
+
             xts_round(&s, wdst, wsrc);
+            gf128mul_x_ble(s.t, s.t);
 
             wsrc += bs;
             wdst += bs;
@@ -221,11 +225,6 @@ static int cpu_crypt(struct blkcipher_desc* d,
         err = blkcipher_walk_done(d, w, avail);
         if (!w->nbytes)
             break;
-
-        avail = w->nbytes;
-
-        wsrc = w->src.virt.addr;
-        wdst = w->dst.virt.addr;
     }
 
     return err;

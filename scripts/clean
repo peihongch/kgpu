@@ -1,5 +1,7 @@
 #!/bin/sh
 
+umount mnt && rmdir mnt
+
 dmsetup remove crypt1
 
 rmmod dm_crypt

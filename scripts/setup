@@ -4,4 +4,8 @@ modprobe dm_mod
 insmod ./dm-crypt.ko
 
 # Create a crypt device using dmsetup
-dmsetup create crypt1 --table "0 `blockdev --getsz $1` crypt aes-gaes_xts-plain babebabebabebabebabebabebabebabebabebabebabebabebabebabebabebabe 0 $1 0"
+dmsetup create crypt1 --table "0 `blockdev --getsz $1` crypt aes-gaes_xts-plain64 babebabebabebabebabebabebabebabebabebabebabebabebabebabebabebabe 0 $1 0"
+
+mkfs.ext4 /dev/mapper/crypt1
+mkdir -p mnt
+mount /dev/mapper/crypt1 mnt

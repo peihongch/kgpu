@@ -678,6 +678,8 @@ static int crypt_convert_blocks(struct crypt_config* cc,
     dmreq = dmreq_of_req(cc, req);
     iv = iv_of_dmreq(cc, dmreq);
 
+    // Use the sector number as the IV,
+    // it might be wrong when encrypting multiple blocks in a batch.
     dmreq->iv_sector = ctx->cc_sector;
     dmreq->ctx = ctx;
 
