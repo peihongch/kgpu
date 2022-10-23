@@ -84,8 +84,6 @@ static int setkey(struct crypto_tfm* parent,
     crypto_cipher_set_flags(child,
                             crypto_tfm_get_flags(parent) & CRYPTO_TFM_REQ_MASK);
     err = crypto_cipher_setkey(child, key + keylen / 2, keylen / 2);
-    // for easy testing only, won't affect performance
-    // err = crypto_cipher_setkey(child, key, keylen);
     if (err)
         return err;
 
@@ -104,15 +102,15 @@ static int setkey(struct crypto_tfm* parent,
     if (err)
         return err;
 
+    crypto_tfm_set_flags(parent,
+                         crypto_cipher_get_flags(child) & CRYPTO_TFM_RES_MASK);
+
     cvt_endian_u32(ctx->aes_ctx.key_enc, AES_MAX_KEYLENGTH_U32);
     cvt_endian_u32(ctx->aes_ctx.key_dec, AES_MAX_KEYLENGTH_U32);
 
     memcpy(ctx->info.key_enc, ctx->aes_ctx.key_enc, AES_MAX_KEYLENGTH);
     memcpy(ctx->info.key_dec, ctx->aes_ctx.key_dec, AES_MAX_KEYLENGTH);
     ctx->info.key_length = ctx->aes_ctx.key_length;
-
-    crypto_tfm_set_flags(parent,
-                         crypto_cipher_get_flags(child) & CRYPTO_TFM_RES_MASK);
 
     return 0;
 }
@@ -228,18 +226,6 @@ static int cpu_crypt(struct blkcipher_desc* d,
     }
 
     return err;
-}
-
-static void gpu_build_ivs(struct priv* ctx,
-                          u8* iv,
-                          void (*tw)(struct crypto_tfm*, u8*, const u8*)) {
-    int i;
-
-    tw(crypto_cipher_tfm(ctx->tweak), (u8*)&(ctx->info.ivs[0]), iv);
-
-    for (i = 1; i < XTS_SECTOR_SIZE / AES_BLOCK_SIZE; i++) {
-        gf128mul_x_ble(&(ctx->info.ivs[i]), &(ctx->info.ivs[i - 1]));
-    }
 }
 
 static int gpu_crypt_nzc(struct blkcipher_desc* d,
@@ -452,8 +438,7 @@ static int gpu_crypt(struct blkcipher_desc* desc,
                      unsigned int nbytes,
                      int enc) {
     struct priv* ctx = crypto_blkcipher_ctx(desc->tfm);
-    gpu_build_ivs(ctx, (u8*)desc->info,
-                  crypto_cipher_alg(ctx->tweak)->cia_encrypt);
+    ctx->info.tweak = *((u64*)(desc->info));
 
     if ((nbytes >> PAGE_SHIFT) >= (split_threshold + (split_threshold >> 1))) {
         unsigned int remainings = nbytes;

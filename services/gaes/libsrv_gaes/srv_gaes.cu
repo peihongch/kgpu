@@ -65,7 +65,9 @@ static void dump_hex(u8* p, int rs, int cs)
 /*
  * Include device code
  */
-#include "dev.cu"
+#include "ecb.cu"
+#include "ctr.cu"
+#include "xts.cu"
 
 int gaes_ecb_compute_size_bpt(struct kgpu_service_request* sr) {
     sr->block_x = sr->outsize >= BPT_BYTES_PER_BLOCK ? BPT_BYTES_PER_BLOCK / 16
@@ -160,18 +162,21 @@ int gaes_xts_launch(struct kgpu_service_request* sr) {
     struct crypto_xts_info* hinfo = (struct crypto_xts_info*)(sr->hdata);
     struct crypto_xts_info* dinfo = (struct crypto_xts_info*)(sr->ddata);
 
-    if (sr->s == &gaes_xts_dec_srv)
+    if (sr->s == &gaes_xts_dec_srv) {
         xts_decrypt<<<dim3(sr->grid_x, sr->grid_y),
                       dim3(sr->block_x, sr->block_y), 0,
-                      (cudaStream_t)(sr->stream)>>>((u32*)dinfo->key_dec,
-                                                    hinfo->key_length / 4 + 6,
-                                                    (u8*)sr->dout, dinfo->ivs);
-    else
+                      (cudaStream_t)(sr->stream)>>>(
+            (uint32_t*)dinfo->key_dec, (uint32_t*)dinfo->key_enc,
+            (uint32_t)hinfo->key_length / 4 + 6, (uint8_t*)sr->dout, 
+            (uint64_t)hinfo->tweak);
+    } else {
         xts_encrypt<<<dim3(sr->grid_x, sr->grid_y),
                       dim3(sr->block_x, sr->block_y), 0,
-                      (cudaStream_t)(sr->stream)>>>((u32*)dinfo->key_enc,
-                                                    hinfo->key_length / 4 + 6,
-                                                    (u8*)sr->dout, dinfo->ivs);
+                      (cudaStream_t)(sr->stream)>>>(
+            (uint32_t*)dinfo->key_enc, (uint32_t*)dinfo->key_enc,
+            (uint32_t)hinfo->key_length / 4 + 6, (uint8_t*)sr->dout, 
+            (uint64_t)hinfo->tweak);
+    }
     return 0;
 }
 

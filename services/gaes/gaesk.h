@@ -12,31 +12,30 @@
 
 #include "gaes_common.h"
 
-#define GAES_ECB_SIZE_THRESHOLD (PAGE_SIZE-1)
-#define GAES_CTR_SIZE_THRESHOLD (PAGE_SIZE-1)
-#define GAES_XTS_SIZE_THRESHOLD (PAGE_SIZE-1)
+#define GAES_ECB_SIZE_THRESHOLD (PAGE_SIZE - 1)
+#define GAES_CTR_SIZE_THRESHOLD (PAGE_SIZE - 1)
+#define GAES_XTS_SIZE_THRESHOLD (4 * PAGE_SIZE)
 
 long test_gaes_ecb(size_t sz, int enc);
 long test_gaes_ctr(size_t sz);
 long test_gaes_lctr(size_t sz);
 
-static void cvt_endian_u32(u32* buf, int n)
-{
-  u8* b = (u8*)buf;
-  int nb = n*4;
-  
-  u8 t;
-  int i;
-  
-  for (i=0; i<nb; i+=4, b+=4) {
-    t = b[0];
-    b[0] = b[3];
-    b[3] = t;
-    
-    t = b[1];
-    b[1] = b[2];
-    b[2] = t;
-  }
+static void cvt_endian_u32(u32* buf, int n) {
+    u8* b = (u8*)buf;
+    int nb = n * 4;
+
+    u8 t;
+    int i;
+
+    for (i = 0; i < nb; i += 4, b += 4) {
+        t = b[0];
+        b[0] = b[3];
+        b[3] = t;
+
+        t = b[1];
+        b[1] = b[2];
+        b[2] = t;
+    }
 }
 
 #if 0

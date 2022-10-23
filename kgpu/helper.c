@@ -73,7 +73,7 @@ static void dump_hex(u8* p, int rs, int cs) {
 }
 
 static int kh_init(void) {
-    int i, len, r;
+    int i, r;
     void* p;
 
     devfd = ssc(open(kgpudev, O_RDWR));
@@ -97,8 +97,6 @@ static int kh_init(void) {
         abort();
     }
     kh_log(KGPU_LOG_PRINT, "mmap start 0x%lX\n", hostvma.uva);
-
-    len = sizeof(struct kgpu_gpu_mem_info);
 
     /* tell kernel the buffers */
     r = ioctl(devfd, KGPU_IOC_SET_GPU_BUFS, (unsigned long)&hostbuf);
