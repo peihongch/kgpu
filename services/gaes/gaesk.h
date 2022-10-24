@@ -14,7 +14,7 @@
 
 #define GAES_ECB_SIZE_THRESHOLD (PAGE_SIZE - 1)
 #define GAES_CTR_SIZE_THRESHOLD (PAGE_SIZE - 1)
-#define GAES_XTS_SIZE_THRESHOLD (4 * PAGE_SIZE)
+#define GAES_XTS_SIZE_THRESHOLD (1 * PAGE_SIZE)
 
 long test_gaes_ecb(size_t sz, int enc);
 long test_gaes_ctr(size_t sz);

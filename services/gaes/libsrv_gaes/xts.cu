@@ -6,9 +6,7 @@
  * Device code file for XTS-AES
  */
 
-
 #include "aes.cu"
-
 
 #define gf128mul_dat(q)                                                    \
     {                                                                      \
@@ -59,25 +57,46 @@
      (i & 0x08 ? xx(04, 38) : 0) ^ (i & 0x04 ? xx(02, 1c) : 0) ^ \
      (i & 0x02 ? xx(01, 0e) : 0) ^ (i & 0x01 ? xx(00, 87) : 0))
 
-typedef unsigned short u16;
+__constant__ uint16_t gf128mul_table_bbe[256] = gf128mul_dat(xda_bbe);
 
-__constant__ u16 gf128mul_table_bbe[256] = gf128mul_dat(xda_bbe);
+#define gf128mul_x_ble(r, x)                                  \
+    (*r = gf128mul_table_bbe[(*(x + 1)) >> 63] ^ ((*x) << 1), \
+     *(r + 1) = ((*(x + 1)) << 1) ^ ((*x) >> 63))
 
-__device__ void gf128mul_x_ble(const uint8_t r[16], const uint8_t x[16]) {
-    uint64_t a = *(uint64_t*)x;
-    uint64_t b = *(uint64_t*)(x + 8);
-    uint64_t _tt = gf128mul_table_bbe[b >> 63];
+//
+// Other gf128mul implementations:
+//
+// 1. function call
+// __device__ void gf128mul_x_ble_fncall(const uint8_t r[16], const uint8_t
+// x[16]) {
+//     uint64_t a = *(uint64_t*)x;
+//     uint64_t b = *(uint64_t*)(x + 8);
+//     uint64_t _tt = gf128mul_table_bbe[b >> 63];
+//
+//     *(uint64_t*)r = _tt ^ (a << 1);
+//     *(uint64_t*)(r + 8) = (b << 1) ^ (a >> 63);
+// }
+//
+// 2. byte wise calculation macro
+// #define gf128mul_x_ble_macro(r, x) (r)[0] = (x)[0] << 1; \
+//     (r)[1] = ((x)[1] << 1) | ((x)[0] >> 7); \
+//     (r)[2] = ((x)[2] << 1) | ((x)[1] >> 7); \
+//     (r)[3] = ((x)[3] << 1) | ((x)[2] >> 7); \
+//     (r)[4] = ((x)[4] << 1) | ((x)[3] >> 7); \
+//     (r)[5] = ((x)[5] << 1) | ((x)[4] >> 7); \
+//     (r)[6] = ((x)[6] << 1) | ((x)[5] >> 7); \
+//     (r)[7] = ((x)[7] << 1) | ((x)[6] >> 7); \
+//     (r)[8] = ((x)[8] << 1) | ((x)[7] >> 7); \
+//     (r)[9] = ((x)[9] << 1) | ((x)[8] >> 7); \
+//     (r)[10] = ((x)[10] << 1) | ((x)[9] >> 7); \
+//     (r)[11] = ((x)[11] << 1) | ((x)[10] >> 7); \
+//     (r)[12] = ((x)[12] << 1) | ((x)[11] >> 7); \
+//     (r)[13] = ((x)[13] << 1) | ((x)[12] >> 7); \
+//     (r)[14] = ((x)[14] << 1) | ((x)[13] >> 7); \
+//     (r)[15] = ((x)[15] << 1) | ((x)[14] >> 7); \
+//     (r)[15] ^= ((x)[15] >> 7) * 0x87
 
-    *(uint64_t*)r = _tt ^ (a << 1);
-    *(uint64_t*)(r + 8) = (b << 1) ^ (a >> 63);
-}
-
-__device__ void be128_xor(uint8_t* r, const uint8_t* p, const uint8_t* q) {
-    unsigned int i;
-    for (i = 0; i < AES_BLOCK_SIZE; i++) {
-        r[i] = p[i] ^ q[i];
-    }
-}
+#define be128_xor(r, p, q) ((r)[0] = (p)[0] ^ (q)[0], (r)[1] = (p)[1] ^ (q)[1])
 
 __global__ void xts_encrypt(uint32_t* crypt_key,
                             uint32_t* tweak_key,
@@ -85,25 +104,24 @@ __global__ void xts_encrypt(uint32_t* crypt_key,
                             uint8_t* data,
                             const uint64_t tweak) {
     unsigned int i;
-    uint8_t tweak_buf[AES_BLOCK_SIZE];
+    uint64_t tweak_buf[AES_BLOCK_SIZE / sizeof(uint64_t)] = {tweak + blockIdx.x,
+                                                             0};
 
     data = data + AES_BLOCK_SIZE * (blockIdx.x * blockDim.x + threadIdx.x);
 
     /* calculate first value of T */
-    *((uint64_t*)tweak_buf) = tweak + blockIdx.x;
-    *(((uint64_t*)tweak_buf) + 1) = 0;
-    aes_encrypt(tweak_key, nrounds, tweak_buf);
+    aes_encrypt(tweak_key, nrounds, (uint8_t*)tweak_buf);
 
     for (i = 1; i <= threadIdx.x; i++) {
         gf128mul_x_ble(tweak_buf, tweak_buf);
     }
 
     /* PP <- T xor P */
-    be128_xor(data, tweak_buf, data);
+    be128_xor((uint64_t*)data, tweak_buf, (uint64_t*)data);
     /* CC <- E(Key2,PP) */
     aes_encrypt(crypt_key, nrounds, data);
     /* C <- C xor CC */
-    be128_xor(data, data, tweak_buf);
+    be128_xor((uint64_t*)data, (uint64_t*)data, tweak_buf);
 }
 
 __global__ void xts_decrypt(uint32_t* crypt_key,
@@ -112,23 +130,22 @@ __global__ void xts_decrypt(uint32_t* crypt_key,
                             uint8_t* data,
                             const uint64_t tweak) {
     unsigned int i;
-    uint8_t tweak_buf[AES_BLOCK_SIZE];
+    uint64_t tweak_buf[AES_BLOCK_SIZE / sizeof(uint64_t)] = {tweak + blockIdx.x,
+                                                             0};
 
     data = data + AES_BLOCK_SIZE * (blockIdx.x * blockDim.x + threadIdx.x);
 
     /* calculate first value of T */
-    *((uint64_t*)tweak_buf) = tweak + blockIdx.x;
-    *(((uint64_t*)tweak_buf) + 1) = 0;
-    aes_encrypt(tweak_key, nrounds, tweak_buf);
+    aes_encrypt(tweak_key, nrounds, (uint8_t*)tweak_buf);
 
     for (i = 1; i <= threadIdx.x; i++) {
         gf128mul_x_ble(tweak_buf, tweak_buf);
     }
 
     /* PP <- T xor P */
-    be128_xor(data, tweak_buf, data);
+    be128_xor((uint64_t*)data, tweak_buf, (uint64_t*)data);
     /* CC <- E(Key2,PP) */
     aes_decrypt(crypt_key, nrounds, data);
     /* C <- C xor CC */
-    be128_xor(data, data, tweak_buf);
+    be128_xor((uint64_t*)data, (uint64_t*)data, tweak_buf);
 }
