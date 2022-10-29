@@ -37,9 +37,9 @@ typedef struct {
 struct crypto_xts_info {
     u32 key_enc[AES_MAX_KEYLENGTH_U32];
     u32 key_dec[AES_MAX_KEYLENGTH_U32];
+    u32 key_twk[AES_MAX_KEYLENGTH_U32];
     u32 key_length;
     u64 tweak;
-    // be128 ivs[XTS_SECTOR_SIZE / AES_BLOCK_SIZE];
 };
 
 #endif

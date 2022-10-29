@@ -65,8 +65,8 @@ static void dump_hex(u8* p, int rs, int cs)
 /*
  * Include device code
  */
-#include "ecb.cu"
 #include "ctr.cu"
+#include "ecb.cu"
 #include "xts.cu"
 
 int gaes_ecb_compute_size_bpt(struct kgpu_service_request* sr) {
@@ -166,15 +166,15 @@ int gaes_xts_launch(struct kgpu_service_request* sr) {
         xts_decrypt<<<dim3(sr->grid_x, sr->grid_y),
                       dim3(sr->block_x, sr->block_y), 0,
                       (cudaStream_t)(sr->stream)>>>(
-            (uint32_t*)dinfo->key_dec, (uint32_t*)dinfo->key_enc,
-            (uint32_t)hinfo->key_length / 4 + 6, (uint8_t*)sr->dout, 
+            (uint32_t*)dinfo->key_dec, (uint32_t*)dinfo->key_twk,
+            (uint32_t)hinfo->key_length / 4 + 6, (uint8_t*)sr->dout,
             (uint64_t)hinfo->tweak);
     } else {
         xts_encrypt<<<dim3(sr->grid_x, sr->grid_y),
                       dim3(sr->block_x, sr->block_y), 0,
                       (cudaStream_t)(sr->stream)>>>(
-            (uint32_t*)dinfo->key_enc, (uint32_t*)dinfo->key_enc,
-            (uint32_t)hinfo->key_length / 4 + 6, (uint8_t*)sr->dout, 
+            (uint32_t*)dinfo->key_enc, (uint32_t*)dinfo->key_twk,
+            (uint32_t)hinfo->key_length / 4 + 6, (uint8_t*)sr->dout,
             (uint64_t)hinfo->tweak);
     }
     return 0;

@@ -83,12 +83,17 @@ static int setkey(struct crypto_tfm* parent,
     crypto_cipher_clear_flags(child, CRYPTO_TFM_REQ_MASK);
     crypto_cipher_set_flags(child,
                             crypto_tfm_get_flags(parent) & CRYPTO_TFM_REQ_MASK);
+
+    err = crypto_aes_expand_key(&ctx->aes_ctx, key + keylen / 2, keylen / 2);
     err = crypto_cipher_setkey(child, key + keylen / 2, keylen / 2);
     if (err)
         return err;
 
     crypto_tfm_set_flags(parent,
                          crypto_cipher_get_flags(child) & CRYPTO_TFM_RES_MASK);
+
+    cvt_endian_u32(ctx->aes_ctx.key_enc, AES_MAX_KEYLENGTH_U32);
+    memcpy(ctx->info.key_twk, ctx->aes_ctx.key_enc, AES_MAX_KEYLENGTH);
 
     child = ctx->child;
 

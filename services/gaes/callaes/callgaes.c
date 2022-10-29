@@ -36,7 +36,7 @@ char* AES_GPU = "gaes_xts(aes)";
 
 char* CIPHER;
 
-#define MAX_BLK_SIZE (32 * 1024 * 1024)
+#define MAX_BLK_SIZE (256 * 1024 * 1024)
 #define MIN_BLK_SIZE (4 * 1024)
 
 #define PLAINTEXT                                                              \
@@ -214,8 +214,6 @@ void test_aes(void) {
                (bs * TEST_TIMES) / dec);
     }
 
-    printk(KERN_INFO "[in buf] %s\n", ins[0]);
-
 free_err_pages:
     for (i = 0; i < npages && ins[i]; i++) {
         free_page((unsigned long)ins[i]);
@@ -260,5 +258,5 @@ static void __exit taes_exit(void) {
 module_init(taes_init);
 module_exit(taes_exit);
 
-MODULE_DESCRIPTION("Test CUDA AES-ECB");
+MODULE_DESCRIPTION("Test CUDA AES-XTS");
 MODULE_LICENSE("GPL");

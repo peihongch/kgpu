@@ -17,6 +17,11 @@ typedef unsigned int u32;
 typedef unsigned short u16;
 typedef unsigned char u8;
 
+/**
+ * For key expansion, it takes a 4-word (16 bytes) key as input,
+ * and output ((nrounds + 1) << 2) word as round key.
+ * Therefore max round key length is (((14 + 1) << 2) * 4) bytes.
+ */
 #define AES_MAX_KEYLENGTH	(15 * 16)
 #define AES_MAX_KEYLENGTH_U32	(AES_MAX_KEYLENGTH / sizeof(u32))
 #define AES_BLOCK_SIZE          (16)
