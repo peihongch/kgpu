@@ -6,36 +6,40 @@
  * All rights reserved.
  *
  */
- 
+
 #ifndef __GPUTILS_H__
 #define __GPUTILS_H__
 
 #define csc(...) _cuda_safe_call(__VA_ARGS__, __FILE__, __LINE__)
-static cudaError_t _cuda_safe_call(cudaError_t e, const char *file, int line) {
-    if (e!=cudaSuccess) {
-	fprintf(stderr, "kgpu Error: %s %d %s\n",
-		file, line, cudaGetErrorString(e));
-	cudaThreadExit();
-	abort();
+static cudaError_t _cuda_safe_call(cudaError_t e, const char* file, int line) {
+    if (e != cudaSuccess) {
+        fprintf(stderr, "kgpu Error: %s %d %s\n", file, line,
+                cudaGetErrorString(e));
+        // @deprecated cudaThreadExit()
+        // see:
+        // https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__THREAD__DEPRECATED.html#group__CUDART__THREAD__DEPRECATED_1g4c6ed00b3df5828ac4c8fa707d7378b5
+        e = cudaDeviceReset();
+        abort();
     }
     return e;
 }
 
-
-static void *alloc_dev_mem(unsigned long size) {
-    void *h;
-    csc( cudaMalloc(&h, size) );
+static void* alloc_dev_mem(unsigned long size) {
+    void* h;
+    csc(cudaMalloc(&h, size));
     return h;
 }
 
-static void free_dev_mem(void *p) {
-    csc( cudaFree(p) );
+static void free_dev_mem(void* p) {
+    csc(cudaFree(p));
 }
 
-#define ah2dcpy(dst, src, sz, stream) \
-    cudaMemcpyAsync((void*)(dst), (void*)(src), (sz), cudaMemcpyHostToDevice, (stream))
+#define ah2dcpy(dst, src, sz, stream)                                         \
+    cudaMemcpyAsync((void*)(dst), (void*)(src), (sz), cudaMemcpyHostToDevice, \
+                    (stream))
 
-#define ad2hcpy(dst, src, sz, stream) \
-    cudaMemcpyAsync((void*)(dst), (void*)(src), (sz), cudaMemcpyDeviceToHost, (stream))
+#define ad2hcpy(dst, src, sz, stream)                                         \
+    cudaMemcpyAsync((void*)(dst), (void*)(src), (sz), cudaMemcpyDeviceToHost, \
+                    (stream))
 
 #endif

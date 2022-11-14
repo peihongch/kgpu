@@ -48,26 +48,12 @@ struct gaes_ctr_data {
     int nr_dblks_per_tblk;
 };
 
-#if 0
-static void dump_hex(u8* p, int rs, int cs)
-{
-    int r,c;
-    printf("\n");
-    for (r=0; r<rs; r++) {
-	for (c=0; c<cs; c++) {
-	    printf("%02x ", p[r*cs+c]);
-	}
-	printf("\n");
-    }
-}
-#endif /* test only */
-
 /*
  * Include device code
  */
 #include "ctr.cu"
 #include "ecb.cu"
-#include "xts.cu"
+#include "xts_hmac.cu"
 
 int gaes_ecb_compute_size_bpt(struct kgpu_service_request* sr) {
     sr->block_x = sr->outsize >= BPT_BYTES_PER_BLOCK ? BPT_BYTES_PER_BLOCK / 16
@@ -163,19 +149,19 @@ int gaes_xts_launch(struct kgpu_service_request* sr) {
     struct crypto_xts_info* dinfo = (struct crypto_xts_info*)(sr->ddata);
 
     if (sr->s == &gaes_xts_dec_srv) {
-        xts_decrypt<<<dim3(sr->grid_x, sr->grid_y),
-                      dim3(sr->block_x, sr->block_y), 0,
-                      (cudaStream_t)(sr->stream)>>>(
+        xts_hmac_decrypt<<<dim3(sr->grid_x, sr->grid_y),
+                           dim3(sr->block_x, sr->block_y), 0,
+                           (cudaStream_t)(sr->stream)>>>(
             (uint32_t*)dinfo->key_dec, (uint32_t*)dinfo->key_twk,
-            (uint32_t)hinfo->key_length / 4 + 6, (uint8_t*)sr->dout,
-            (uint64_t)hinfo->tweak);
+            (uint32_t*)dinfo->key_hmac, 2 * (uint32_t)hinfo->key_length,
+            (uint8_t*)sr->dout, (uint64_t)hinfo->tweak, NULL, 0);
     } else {
-        xts_encrypt<<<dim3(sr->grid_x, sr->grid_y),
-                      dim3(sr->block_x, sr->block_y), 0,
-                      (cudaStream_t)(sr->stream)>>>(
+        xts_hmac_encrypt<<<dim3(sr->grid_x, sr->grid_y),
+                           dim3(sr->block_x, sr->block_y), 0,
+                           (cudaStream_t)(sr->stream)>>>(
             (uint32_t*)dinfo->key_enc, (uint32_t*)dinfo->key_twk,
-            (uint32_t)hinfo->key_length / 4 + 6, (uint8_t*)sr->dout,
-            (uint64_t)hinfo->tweak);
+            (uint32_t*)dinfo->key_hmac, 2 * (uint32_t)hinfo->key_length,
+            (uint8_t*)sr->dout, (uint64_t)hinfo->tweak, NULL, 0);
     }
     return 0;
 }

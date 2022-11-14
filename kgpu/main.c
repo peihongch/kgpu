@@ -533,6 +533,7 @@ static void fill_ku_request(struct kgpu_ku_request* kureq,
 
 ssize_t kgpu_read(struct file* filp, char __user* buf, size_t c, loff_t* fpos) {
     ssize_t ret = 0;
+    int err;
     struct list_head* r;
     struct _kgpu_request_item* item;
 
@@ -557,7 +558,7 @@ ssize_t kgpu_read(struct file* filp, char __user* buf, size_t c, loff_t* fpos) {
         fill_ku_request(&kureq, item->r);
 
         // FIX BUG: memcpy(buf, &kureq, sizeof(struct kgpu_ku_request));
-        copy_to_user(buf, &kureq, sizeof(struct kgpu_ku_request));
+        err = copy_to_user(buf, &kureq, sizeof(struct kgpu_ku_request));
         ret = c;
     }
 
@@ -584,6 +585,7 @@ ssize_t kgpu_write(struct file* filp,
     struct kgpu_ku_response kuresp;
     struct _kgpu_request_item* item;
     ssize_t ret = 0;
+    int err;
     size_t realcount;
 
     if (count < sizeof(struct kgpu_ku_response))
@@ -592,7 +594,7 @@ ssize_t kgpu_write(struct file* filp,
         realcount = sizeof(struct kgpu_ku_response);
 
         // FIX BUG: memcpy /*copy_from_user*/ (&kuresp, buf, realcount);
-        copy_from_user(&kuresp, buf, realcount);
+        err = copy_from_user(&kuresp, buf, realcount);
 
         item = find_request(kuresp.id, 1);
         if (!item) {
@@ -660,12 +662,12 @@ static int clear_gpu_mempool(void) {
 static int set_gpu_mempool(char __user* buf) {
     struct kgpu_gpu_mem_info gb;
     struct _kgpu_mempool* gmp = &kgpudev.gmpool;
-    int i;
+    int i, r;
     int err = 0;
 
     spin_lock(&(kgpudev.gmpool_lock));
 
-    copy_from_user(&gb, buf, sizeof(struct kgpu_gpu_mem_info));
+    r = copy_from_user(&gb, buf, sizeof(struct kgpu_gpu_mem_info));
 
     /* set up pages mem */
     gmp->uva = (unsigned long)(gb.uva);

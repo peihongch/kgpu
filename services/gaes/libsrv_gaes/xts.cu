@@ -70,7 +70,7 @@ __device__ void gf128mul_x_ble(const uint8_t r[16], const uint8_t x[16]) {
 
 #define be128_xor(r, p, q) ((r)[0] = (p)[0] ^ (q)[0], (r)[1] = (p)[1] ^ (q)[1])
 
-__global__ void xts_encrypt(uint32_t* crypt_key,
+__device__ void xts_encrypt(uint32_t* crypt_key,
                             uint32_t* tweak_key,
                             uint32_t nrounds,
                             uint8_t* data,
@@ -96,7 +96,7 @@ __global__ void xts_encrypt(uint32_t* crypt_key,
     be128_xor((uint64_t*)data, (uint64_t*)data, tweak_buf);
 }
 
-__global__ void xts_decrypt(uint32_t* crypt_key,
+__device__ void xts_decrypt(uint32_t* crypt_key,
                             uint32_t* tweak_key,
                             uint32_t nrounds,
                             uint8_t* data,

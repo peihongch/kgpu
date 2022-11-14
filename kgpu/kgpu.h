@@ -14,16 +14,15 @@
 
 #define TO_UL(v) ((unsigned long)(v))
 
-#define ADDR_WITHIN(pointer, base, size)		\
-    (TO_UL(pointer) >= TO_UL(base) &&			\
-     (TO_UL(pointer) < TO_UL(base)+TO_UL(size)))
+#define ADDR_WITHIN(pointer, base, size) \
+    (TO_UL(pointer) >= TO_UL(base) &&    \
+     (TO_UL(pointer) < TO_UL(base) + TO_UL(size)))
 
-#define ADDR_REBASE(dst_base, src_base, pointer)			\
-    (TO_UL(dst_base) + (						\
-	TO_UL(pointer)-TO_UL(src_base)))
+#define ADDR_REBASE(dst_base, src_base, pointer) \
+    (TO_UL(dst_base) + (TO_UL(pointer) - TO_UL(src_base)))
 
 struct kgpu_gpu_mem_info {
-    void *uva;
+    void* uva;
     unsigned long size;
 };
 
@@ -54,7 +53,7 @@ struct kgpu_ku_response {
 
 /* the NR will not be used */
 #define KGPU_BUF_NR 1
-#define KGPU_BUF_SIZE (1024*1024*1024)
+#define KGPU_BUF_SIZE (1024 * 1024 * 1024)
 
 #define KGPU_MMAP_SIZE KGPU_BUF_SIZE
 
@@ -69,8 +68,8 @@ struct kgpu_ku_response {
     _IOW(KGPU_IOC_MAGIC, 1, struct kgpu_gpu_mem_info[KGPU_BUF_NR])
 #define KGPU_IOC_GET_GPU_BUFS \
     _IOR(KGPU_IOC_MAGIC, 2, struct kgpu_gpu_mem_info[KGPU_BUF_NR])
-#define KGPU_IOC_SET_STOP     _IO(KGPU_IOC_MAGIC, 3)
-#define KGPU_IOC_GET_REQS     _IOR(KGPU_IOC_MAGIC, 4, 
+#define KGPU_IOC_SET_STOP _IO(KGPU_IOC_MAGIC, 3)
+#define KGPU_IOC_GET_REQS     _IOR(KGPU_IOC_MAGIC, 4,
 
 #define KGPU_IOC_MAXNR 4
 
@@ -87,11 +86,11 @@ struct kgpu_service;
 
 struct kgpu_service_request {
     int id;
-    void *hin, *hout, *hdata;   // host
-    void *din, *dout, *ddata;   // device
+    void *hin, *hout, *hdata;  // host
+    void *din, *dout, *ddata;  // device
     unsigned long insize, outsize, datasize;
     int errcode;
-    struct kgpu_service *s;
+    struct kgpu_service* s;
     int block_x, block_y;
     int grid_x, grid_y;
     int state;
@@ -117,10 +116,11 @@ struct kgpu_service_request {
 #ifdef __KERNEL__
 
 #include <linux/list.h>
+#include <linux/mm_types.h>
 
 struct kgpu_request;
 
-typedef int (*kgpu_callback)(struct kgpu_request *req);
+typedef int (*kgpu_callback)(struct kgpu_request* req);
 
 struct kgpu_request {
     int id;
@@ -138,11 +138,11 @@ extern int kgpu_next_request_id(void);
 extern struct kgpu_request* kgpu_alloc_request(void);
 extern void kgpu_free_request(struct kgpu_request*);
 
-extern void *kgpu_vmalloc(unsigned long nbytes);
+extern void* kgpu_vmalloc(unsigned long nbytes);
 extern void kgpu_vfree(void* p);
 
-extern void *kgpu_map_pfns(unsigned long *pfns, int n);
-extern void *kgpu_map_pages(struct page **pages, int n);
+extern void* kgpu_map_pfns(unsigned long* pfns, int n);
+extern void* kgpu_map_pages(struct page** pages, int n);
 extern void kgpu_unmap_area(unsigned long addr);
 extern int kgpu_map_page(struct page*, unsigned long);
 extern void kgpu_free_mmap_area(unsigned long);

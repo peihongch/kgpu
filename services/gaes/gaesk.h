@@ -38,29 +38,4 @@ static void cvt_endian_u32(u32* buf, int n) {
     }
 }
 
-#if 0
-static void dump_page_content(u8 *p)
-{
-    int r,c;
-    printk("dump page content:\n");
-    for (r=0; r<16; r++) {
-	for (c=0; c<32; c++)
-	    printk("%02x ", p[r*32+c]);
-	printk("\n");
-    }
-}
-
-static void dump_hex(u8 *p, int r, int c)
-{
-    int i,j;
-    printk("dump hex:\n");
-    for (i=0; i<r; i++) {
-	for (j=0; j<c; j++) {
-	    printk("%02x ", p[c*i+j]);
-	}
-	printk("\n");
-    }    
-}
-#endif /* test only */
-
 #endif
