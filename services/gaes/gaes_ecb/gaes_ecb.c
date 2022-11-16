@@ -455,8 +455,8 @@ static int crypto_gaes_ecb_encrypt(struct blkcipher_desc* desc,
                                    struct scatterlist* dst,
                                    struct scatterlist* src,
                                    unsigned int nbytes) {
-    // if (/*nbytes%PAGE_SIZE != 0 ||*/ nbytes <= GAES_ECB_SIZE_THRESHOLD)
-    //     return crypto_ecb_encrypt(desc, dst, src, nbytes);
+    if (/*nbytes%PAGE_SIZE != 0 ||*/ nbytes <= GAES_ECB_SIZE_THRESHOLD)
+        return crypto_ecb_encrypt(desc, dst, src, nbytes);
     return crypto_ecb_gpu_crypt(desc, dst, src, nbytes, 1);
 }
 
@@ -464,8 +464,8 @@ static int crypto_gaes_ecb_decrypt(struct blkcipher_desc* desc,
                                    struct scatterlist* dst,
                                    struct scatterlist* src,
                                    unsigned int nbytes) {
-    // if (/*nbytes%PAGE_SIZE != 0 ||*/ nbytes <= GAES_ECB_SIZE_THRESHOLD)
-    //     return crypto_ecb_decrypt(desc, dst, src, nbytes);
+    if (/*nbytes%PAGE_SIZE != 0 ||*/ nbytes <= GAES_ECB_SIZE_THRESHOLD)
+        return crypto_ecb_decrypt(desc, dst, src, nbytes);
     return crypto_ecb_gpu_crypt(desc, dst, src, nbytes, 0);
 }
 

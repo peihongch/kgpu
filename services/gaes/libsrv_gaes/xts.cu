@@ -59,42 +59,14 @@
 
 __constant__ uint16_t gf128mul_table_bbe[256] = gf128mul_dat(xda_bbe);
 
-#define gf128mul_x_ble(r, x)                                  \
-    (*r = gf128mul_table_bbe[(*(x + 1)) >> 63] ^ ((*x) << 1), \
-     *(r + 1) = ((*(x + 1)) << 1) ^ ((*x) >> 63))
+__device__ void gf128mul_x_ble(const uint8_t r[16], const uint8_t x[16]) {
+    uint64_t a = *(uint64_t*)x;
+    uint64_t b = *(uint64_t*)(x + 8);
+    uint64_t _tt = gf128mul_table_bbe[b >> 63];
 
-//
-// Other gf128mul implementations:
-//
-// 1. function call
-// __device__ void gf128mul_x_ble_fncall(const uint8_t r[16], const uint8_t
-// x[16]) {
-//     uint64_t a = *(uint64_t*)x;
-//     uint64_t b = *(uint64_t*)(x + 8);
-//     uint64_t _tt = gf128mul_table_bbe[b >> 63];
-//
-//     *(uint64_t*)r = _tt ^ (a << 1);
-//     *(uint64_t*)(r + 8) = (b << 1) ^ (a >> 63);
-// }
-//
-// 2. byte wise calculation macro
-// #define gf128mul_x_ble_macro(r, x) (r)[0] = (x)[0] << 1; \
-//     (r)[1] = ((x)[1] << 1) | ((x)[0] >> 7); \
-//     (r)[2] = ((x)[2] << 1) | ((x)[1] >> 7); \
-//     (r)[3] = ((x)[3] << 1) | ((x)[2] >> 7); \
-//     (r)[4] = ((x)[4] << 1) | ((x)[3] >> 7); \
-//     (r)[5] = ((x)[5] << 1) | ((x)[4] >> 7); \
-//     (r)[6] = ((x)[6] << 1) | ((x)[5] >> 7); \
-//     (r)[7] = ((x)[7] << 1) | ((x)[6] >> 7); \
-//     (r)[8] = ((x)[8] << 1) | ((x)[7] >> 7); \
-//     (r)[9] = ((x)[9] << 1) | ((x)[8] >> 7); \
-//     (r)[10] = ((x)[10] << 1) | ((x)[9] >> 7); \
-//     (r)[11] = ((x)[11] << 1) | ((x)[10] >> 7); \
-//     (r)[12] = ((x)[12] << 1) | ((x)[11] >> 7); \
-//     (r)[13] = ((x)[13] << 1) | ((x)[12] >> 7); \
-//     (r)[14] = ((x)[14] << 1) | ((x)[13] >> 7); \
-//     (r)[15] = ((x)[15] << 1) | ((x)[14] >> 7); \
-//     (r)[15] ^= ((x)[15] >> 7) * 0x87
+    *(uint64_t*)r = _tt ^ (a << 1);
+    *(uint64_t*)(r + 8) = (b << 1) ^ (a >> 63);
+}
 
 #define be128_xor(r, p, q) ((r)[0] = (p)[0] ^ (q)[0], (r)[1] = (p)[1] ^ (q)[1])
 
@@ -113,7 +85,7 @@ __global__ void xts_encrypt(uint32_t* crypt_key,
     aes_encrypt(tweak_key, nrounds, (uint8_t*)tweak_buf);
 
     for (i = 1; i <= threadIdx.x; i++) {
-        gf128mul_x_ble(tweak_buf, tweak_buf);
+        gf128mul_x_ble((uint8_t*)tweak_buf, (uint8_t*)tweak_buf);
     }
 
     /* PP <- T xor P */
@@ -139,7 +111,7 @@ __global__ void xts_decrypt(uint32_t* crypt_key,
     aes_encrypt(tweak_key, nrounds, (uint8_t*)tweak_buf);
 
     for (i = 1; i <= threadIdx.x; i++) {
-        gf128mul_x_ble(tweak_buf, tweak_buf);
+        gf128mul_x_ble((uint8_t*)tweak_buf, (uint8_t*)tweak_buf);
     }
 
     /* PP <- T xor P */
