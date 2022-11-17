@@ -28,12 +28,12 @@
 #include "../gaesk.h"
 
 /* customized log function */
-#define g_log(level, ...) kgpu_do_log(level, "gaes_ctr", ##__VA_ARGS__)
+#define g_log(level, ...) kgpu_do_log(level, "gctr", ##__VA_ARGS__)
 #define dbg(...) g_log(KGPU_LOG_DEBUG, ##__VA_ARGS__)
 
 struct crypto_ctr_ctx {
     struct crypto_cipher *child;
-    struct crypto_gaes_ctr_info info;
+    struct crypto_gctr_info info;
     u8 key[AES_MAX_KEY_SIZE];	
 };
 
@@ -52,7 +52,7 @@ static int _crypto_ctr_setkey(struct crypto_tfm *parent, const u8 *key,
 {
     struct crypto_ctr_ctx *ctx = crypto_tfm_ctx(parent);
     struct crypto_cipher *child = ctx->child;
-    struct crypto_gaes_ctr_config *cfg = NULL;
+    struct crypto_gctr_config *cfg = NULL;
     int err;
 
     crypto_cipher_clear_flags(child, CRYPTO_TFM_REQ_MASK);
@@ -62,7 +62,7 @@ static int _crypto_ctr_setkey(struct crypto_tfm *parent, const u8 *key,
     /* local couter cipher, with explict range size */
     if (use_lctr) {
 	if (keylen > AES_MAX_KEY_SIZE) {
-	    cfg = (struct crypto_gaes_ctr_config*)(key+AES_MAX_KEY_SIZE);
+	    cfg = (struct crypto_gctr_config*)(key+AES_MAX_KEY_SIZE);
 	    keylen = cfg->key_length;
 	    ctx->info.ctr_range = cfg->ctr_range;
 	    if (cfg->ctr_range > PAGE_SIZE) {
@@ -244,7 +244,7 @@ crypto_ctr_crypt(struct blkcipher_desc *desc,
 }
 
 static int
-_crypto_gaes_ctr_crypt(
+_crypto_gctr_crypt(
     struct blkcipher_desc *desc,
     struct scatterlist *dst, struct scatterlist *src,
     unsigned int sz)
@@ -263,7 +263,7 @@ _crypto_gaes_ctr_crypt(
 
     blkcipher_walk_init(&walk, dst, src, sz);
 
-    buf = kgpu_vmalloc(rsz+sizeof(struct crypto_gaes_ctr_info));
+    buf = kgpu_vmalloc(rsz+sizeof(struct crypto_gctr_info));
     if (!buf) {
 	g_log(KGPU_LOG_ERROR, "GPU buffer is null.\n");
 	return -EFAULT;
@@ -278,9 +278,9 @@ _crypto_gaes_ctr_crypt(
 
     req->in = buf;
     req->out = buf;
-    req->insize = rsz+sizeof(struct crypto_gaes_ctr_info);
+    req->insize = rsz+sizeof(struct crypto_gctr_info);
     req->outsize = sz;
-    req->udatasize = sizeof(struct crypto_gaes_ctr_info);
+    req->udatasize = sizeof(struct crypto_gctr_info);
     req->udata = buf+rsz;
     	
     err = blkcipher_walk_virt(desc, &walk);
@@ -295,18 +295,18 @@ _crypto_gaes_ctr_crypt(
 	err = blkcipher_walk_done(desc, &walk, 0);
     }
 	
-    memcpy(req->udata, &(ctx->info), sizeof(struct crypto_gaes_ctr_info));
+    memcpy(req->udata, &(ctx->info), sizeof(struct crypto_gctr_info));
     if (ctrblk)
-	memcpy(((struct crypto_gaes_ctr_info*)req->udata)->ctrblk, ctrblk,
+	memcpy(((struct crypto_gctr_info*)req->udata)->ctrblk, ctrblk,
 	       crypto_cipher_blocksize(ctx->child));
 
     if (ctx->info.ctr_range) {
-	strcpy(req->service_name, "gaes_lctr");
-	memset(((struct crypto_gaes_ctr_info*)req->udata)->ctrblk, 0,
+	strcpy(req->service_name, "glctr");
+	memset(((struct crypto_gctr_info*)req->udata)->ctrblk, 0,
 	       crypto_cipher_blocksize(ctx->child));
     }
     else
-	strcpy(req->service_name, "gaes_ctr");
+	strcpy(req->service_name, "gctr");
 	
     if (kgpu_call_sync(req)) {
 	err = -EFAULT;
@@ -338,18 +338,18 @@ _crypto_gaes_ctr_crypt(
 }
 
 static int
-crypto_gaes_ctr_crypt(
+crypto_gctr_crypt(
     struct blkcipher_desc *desc,
     struct scatterlist *dst, struct scatterlist *src,
     unsigned int nbytes)
 {
-    if (/*(nbytes % PAGE_SIZE) ||*/ nbytes <= GAES_CTR_SIZE_THRESHOLD)
+    if (/*(nbytes % PAGE_SIZE) ||*/ nbytes <= GCTR_SIZE_THRESHOLD)
 	return crypto_ctr_crypt(desc, dst, src, nbytes);
-    return _crypto_gaes_ctr_crypt(desc, dst, src, nbytes);
+    return _crypto_gctr_crypt(desc, dst, src, nbytes);
 }
 
 static int
-crypto_gaes_lctr_crypt(
+crypto_glctr_crypt(
     struct blkcipher_desc *desc,
     struct scatterlist *dst, struct scatterlist *src,
     unsigned int nbytes)
@@ -363,7 +363,7 @@ crypto_gaes_lctr_crypt(
 		  "multiple of %u\n", ctx->info.ctr_range);
 	    return crypto_ctr_crypt(desc, dst, src, nbytes);
     }		
-    return _crypto_gaes_ctr_crypt(desc, dst, src, nbytes);
+    return _crypto_gctr_crypt(desc, dst, src, nbytes);
 }
 
 static int crypto_ctr_init_tfm(struct crypto_tfm *tfm)
@@ -415,9 +415,9 @@ _crypto_ctr_alloc(struct rtattr **tb, int use_lctr)
 	goto out_put_alg;
 
     if (use_lctr)
-	inst = crypto_alloc_instance("gaes_lctr", alg);
+	inst = crypto_alloc_instance("glctr", alg);
     else
-	inst = crypto_alloc_instance("gaes_ctr", alg);
+	inst = crypto_alloc_instance("gctr", alg);
     if (IS_ERR(inst))
 	goto out;
 
@@ -433,7 +433,7 @@ _crypto_ctr_alloc(struct rtattr **tb, int use_lctr)
     /* not quite sure whether this is OK */
     inst->alg.cra_blkcipher.max_keysize =
 	use_lctr?
-	alg->cra_cipher.cia_max_keysize+sizeof(struct crypto_gaes_ctr_config)
+	alg->cra_cipher.cia_max_keysize+sizeof(struct crypto_gctr_config)
 	:alg->cra_cipher.cia_max_keysize;
 
     inst->alg.cra_ctxsize = sizeof(struct crypto_ctr_ctx);
@@ -444,9 +444,9 @@ _crypto_ctr_alloc(struct rtattr **tb, int use_lctr)
     inst->alg.cra_blkcipher.setkey =
 	use_lctr?crypto_lctr_setkey:crypto_ctr_setkey;
     inst->alg.cra_blkcipher.encrypt =
-	use_lctr?crypto_gaes_lctr_crypt:crypto_gaes_ctr_crypt;
+	use_lctr?crypto_glctr_crypt:crypto_gctr_crypt;
     inst->alg.cra_blkcipher.decrypt =
-	use_lctr?crypto_gaes_lctr_crypt:crypto_gaes_ctr_crypt;
+	use_lctr?crypto_glctr_crypt:crypto_gctr_crypt;
 
     inst->alg.cra_blkcipher.geniv = "chainiv";
 
@@ -476,14 +476,14 @@ static void crypto_ctr_free(struct crypto_instance *inst)
 }
 
 static struct crypto_template crypto_ctr_tmpl = {
-    .name = "gaes_ctr",
+    .name = "gctr",
     .alloc = crypto_ctr_alloc,
     .free = crypto_ctr_free,
     .module = THIS_MODULE,
 };
 
 static struct crypto_template crypto_lctr_tmpl = {
-    .name = "gaes_lctr",
+    .name = "glctr",
     .alloc = crypto_lctr_alloc,
     .free = crypto_ctr_free,
     .module = THIS_MODULE,
@@ -491,17 +491,17 @@ static struct crypto_template crypto_lctr_tmpl = {
 
 #include "../gaes_test.c"
 
-long test_gaes_ctr(size_t sz)
+long test_gctr(size_t sz)
 {
-    return test_gaes(sz, 1, "gaes_ctr(aes)");
+    return test_gaes(sz, 1, "gctr(aes)");
 }
-EXPORT_SYMBOL_GPL(test_gaes_ctr);
+EXPORT_SYMBOL_GPL(test_gctr);
 
-long test_gaes_lctr(size_t sz)
+long test_glctr(size_t sz)
 {
-    return test_gaes(sz, 1, "gaes_lctr(aes)");
+    return test_gaes(sz, 1, "glctr(aes)");
 }
-EXPORT_SYMBOL_GPL(test_gaes_lctr);
+EXPORT_SYMBOL_GPL(test_glctr);
 
 static int __init crypto_ctr_module_init(void)
 {

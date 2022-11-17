@@ -25,16 +25,16 @@
 #include "../gaesk.h"
 
 /* customized log function */
-#define g_log(level, ...) kgpu_do_log(level, "gaes_ecb", ##__VA_ARGS__)
+#define g_log(level, ...) kgpu_do_log(level, "gecb", ##__VA_ARGS__)
 #define dbg(...) g_log(KGPU_LOG_DEBUG, ##__VA_ARGS__)
 
-struct crypto_gaes_ecb_ctx {
+struct crypto_gecb_ctx {
     struct crypto_cipher* child;
     struct crypto_aes_ctx aes_ctx;
     u8 key[32];
 };
 
-struct gaes_ecb_async_data {
+struct gecb_async_data {
     struct completion* c;          /* async-call completion */
     struct scatterlist *dst, *src; /* crypt destination and source */
     struct blkcipher_desc* desc;   /* cipher descriptor */
@@ -57,10 +57,10 @@ module_param(max_splits, int, 0444);
 MODULE_PARM_DESC(max_splits,
                  "max number of sub-requests a big one be split, default 8");
 
-static int crypto_gaes_ecb_setkey(struct crypto_tfm* parent,
+static int crypto_gecb_setkey(struct crypto_tfm* parent,
                                   const u8* key,
                                   unsigned int keylen) {
-    struct crypto_gaes_ecb_ctx* ctx = crypto_tfm_ctx(parent);
+    struct crypto_gecb_ctx* ctx = crypto_tfm_ctx(parent);
     struct crypto_cipher* child = ctx->child;
     int err;
 
@@ -111,7 +111,7 @@ static void __done_cryption(struct blkcipher_desc* desc,
 }
 
 static int async_gpu_callback(struct kgpu_request* req) {
-    struct gaes_ecb_async_data* data = (struct gaes_ecb_async_data*)req->kdata;
+    struct gecb_async_data* data = (struct gecb_async_data*)req->kdata;
 
     if (!zero_copy)
         __done_cryption(data->desc, data->dst, data->src, data->sz,
@@ -132,7 +132,7 @@ static int async_gpu_callback(struct kgpu_request* req) {
     return 0;
 }
 
-static int crypto_gaes_ecb_crypt(struct blkcipher_desc* desc,
+static int crypto_gecb_crypt(struct blkcipher_desc* desc,
                                  struct scatterlist* dst,
                                  struct scatterlist* src,
                                  unsigned int sz,
@@ -148,7 +148,7 @@ static int crypto_gaes_ecb_crypt(struct blkcipher_desc* desc,
     char* buf;
 
     struct crypto_blkcipher* tfm = desc->tfm;
-    struct crypto_gaes_ecb_ctx* ctx = crypto_blkcipher_ctx(tfm);
+    struct crypto_gecb_ctx* ctx = crypto_blkcipher_ctx(tfm);
     struct blkcipher_walk walk;
 
     buf = kgpu_vmalloc(rsz + sizeof(struct crypto_aes_ctx));
@@ -190,11 +190,11 @@ static int crypto_gaes_ecb_crypt(struct blkcipher_desc* desc,
     }
 
     memcpy(req->udata, &(ctx->aes_ctx), sizeof(struct crypto_aes_ctx));
-    strcpy(req->service_name, enc ? "gaes_ecb-enc" : "gaes_ecb-dec");
+    strcpy(req->service_name, enc ? "gecb-enc" : "gecb-dec");
 
     if (c) {
-        struct gaes_ecb_async_data* adata =
-            kmalloc(sizeof(struct gaes_ecb_async_data), GFP_KERNEL);
+        struct gecb_async_data* adata =
+            kmalloc(sizeof(struct gecb_async_data), GFP_KERNEL);
         if (!adata) {
             g_log(KGPU_LOG_ERROR, "out of mem for async data\n");
             // TODO: do something here
@@ -226,7 +226,7 @@ static int crypto_gaes_ecb_crypt(struct blkcipher_desc* desc,
     return err;
 }
 
-static int crypto_gaes_ecb_crypt_zc(struct blkcipher_desc* desc,
+static int crypto_gecb_crypt_zc(struct blkcipher_desc* desc,
                                     struct scatterlist* dst,
                                     struct scatterlist* src,
                                     unsigned int sz,
@@ -244,7 +244,7 @@ static int crypto_gaes_ecb_crypt_zc(struct blkcipher_desc* desc,
     struct scatterlist* sg;
 
     struct crypto_blkcipher* tfm = desc->tfm;
-    struct crypto_gaes_ecb_ctx* ctx = crypto_blkcipher_ctx(tfm);
+    struct crypto_gecb_ctx* ctx = crypto_blkcipher_ctx(tfm);
 
     char* data = (char*)__get_free_page(GFP_KERNEL);
     if (!data) {
@@ -282,7 +282,7 @@ static int crypto_gaes_ecb_crypt_zc(struct blkcipher_desc* desc,
     req->udata = (void*)(addr + rsz);
 
     memcpy(data, &(ctx->aes_ctx), sizeof(struct crypto_aes_ctx));
-    strcpy(req->service_name, enc ? "gaes_ecb-enc" : "gaes_ecb-dec");
+    strcpy(req->service_name, enc ? "gecb-enc" : "gecb-dec");
 
     pgoff = offset >> PAGE_SHIFT;
     n = pgoff + (rsz >> PAGE_SHIFT);
@@ -308,8 +308,8 @@ static int crypto_gaes_ecb_crypt_zc(struct blkcipher_desc* desc,
         }
 
     if (c) {
-        struct gaes_ecb_async_data* adata =
-            kmalloc(sizeof(struct gaes_ecb_async_data), GFP_KERNEL);
+        struct gecb_async_data* adata =
+            kmalloc(sizeof(struct gecb_async_data), GFP_KERNEL);
         if (!adata) {
             g_log(KGPU_LOG_ERROR, "out of mem for async data\n");
             // TODO: do something here
@@ -370,11 +370,11 @@ static int crypto_ecb_gpu_crypt(struct blkcipher_desc* desc,
             for (i = 0; i < nparts && remainings > 0; i++) {
                 init_completion(cs + i);
                 if (zero_copy)
-                    ret = crypto_gaes_ecb_crypt_zc(
+                    ret = crypto_gecb_crypt_zc(
                         desc, dst, src, (i == nparts - 1) ? remainings : partsz,
                         enc, cs + i, i * partsz);
                 else
-                    ret = crypto_gaes_ecb_crypt(
+                    ret = crypto_gecb_crypt(
                         desc, dst, src, (i == nparts - 1) ? remainings : partsz,
                         enc, cs + i, i * partsz);
 
@@ -392,8 +392,8 @@ static int crypto_ecb_gpu_crypt(struct blkcipher_desc* desc,
     }
 
     return zero_copy
-               ? crypto_gaes_ecb_crypt_zc(desc, dst, src, nbytes, enc, NULL, 0)
-               : crypto_gaes_ecb_crypt(desc, dst, src, nbytes, enc, NULL, 0);
+               ? crypto_gecb_crypt_zc(desc, dst, src, nbytes, enc, NULL, 0)
+               : crypto_gecb_crypt(desc, dst, src, nbytes, enc, NULL, 0);
 }
 
 static int crypto_ecb_crypt(struct blkcipher_desc* desc,
@@ -429,7 +429,7 @@ static int crypto_ecb_encrypt(struct blkcipher_desc* desc,
                               unsigned int nbytes) {
     struct blkcipher_walk walk;
     struct crypto_blkcipher* tfm = desc->tfm;
-    struct crypto_gaes_ecb_ctx* ctx = crypto_blkcipher_ctx(tfm);
+    struct crypto_gecb_ctx* ctx = crypto_blkcipher_ctx(tfm);
     struct crypto_cipher* child = ctx->child;
 
     blkcipher_walk_init(&walk, dst, src, nbytes);
@@ -443,7 +443,7 @@ static int crypto_ecb_decrypt(struct blkcipher_desc* desc,
                               unsigned int nbytes) {
     struct blkcipher_walk walk;
     struct crypto_blkcipher* tfm = desc->tfm;
-    struct crypto_gaes_ecb_ctx* ctx = crypto_blkcipher_ctx(tfm);
+    struct crypto_gecb_ctx* ctx = crypto_blkcipher_ctx(tfm);
     struct crypto_cipher* child = ctx->child;
 
     blkcipher_walk_init(&walk, dst, src, nbytes);
@@ -451,28 +451,28 @@ static int crypto_ecb_decrypt(struct blkcipher_desc* desc,
                             crypto_cipher_alg(child)->cia_decrypt);
 }
 
-static int crypto_gaes_ecb_encrypt(struct blkcipher_desc* desc,
+static int crypto_gecb_encrypt(struct blkcipher_desc* desc,
                                    struct scatterlist* dst,
                                    struct scatterlist* src,
                                    unsigned int nbytes) {
-    if (/*nbytes%PAGE_SIZE != 0 ||*/ nbytes <= GAES_ECB_SIZE_THRESHOLD)
+    if (/*nbytes%PAGE_SIZE != 0 ||*/ nbytes <= GECB_SIZE_THRESHOLD)
         return crypto_ecb_encrypt(desc, dst, src, nbytes);
     return crypto_ecb_gpu_crypt(desc, dst, src, nbytes, 1);
 }
 
-static int crypto_gaes_ecb_decrypt(struct blkcipher_desc* desc,
+static int crypto_gecb_decrypt(struct blkcipher_desc* desc,
                                    struct scatterlist* dst,
                                    struct scatterlist* src,
                                    unsigned int nbytes) {
-    if (/*nbytes%PAGE_SIZE != 0 ||*/ nbytes <= GAES_ECB_SIZE_THRESHOLD)
+    if (/*nbytes%PAGE_SIZE != 0 ||*/ nbytes <= GECB_SIZE_THRESHOLD)
         return crypto_ecb_decrypt(desc, dst, src, nbytes);
     return crypto_ecb_gpu_crypt(desc, dst, src, nbytes, 0);
 }
 
-static int crypto_gaes_ecb_init_tfm(struct crypto_tfm* tfm) {
+static int crypto_gecb_init_tfm(struct crypto_tfm* tfm) {
     struct crypto_instance* inst = (void*)tfm->__crt_alg;
     struct crypto_spawn* spawn = crypto_instance_ctx(inst);
-    struct crypto_gaes_ecb_ctx* ctx = crypto_tfm_ctx(tfm);
+    struct crypto_gecb_ctx* ctx = crypto_tfm_ctx(tfm);
     struct crypto_cipher* cipher;
 
     cipher = crypto_spawn_cipher(spawn);
@@ -483,12 +483,12 @@ static int crypto_gaes_ecb_init_tfm(struct crypto_tfm* tfm) {
     return 0;
 }
 
-static void crypto_gaes_ecb_exit_tfm(struct crypto_tfm* tfm) {
-    struct crypto_gaes_ecb_ctx* ctx = crypto_tfm_ctx(tfm);
+static void crypto_gecb_exit_tfm(struct crypto_tfm* tfm) {
+    struct crypto_gecb_ctx* ctx = crypto_tfm_ctx(tfm);
     crypto_free_cipher(ctx->child);
 }
 
-static struct crypto_instance* crypto_gaes_ecb_alloc(struct rtattr** tb) {
+static struct crypto_instance* crypto_gecb_alloc(struct rtattr** tb) {
     struct crypto_instance* inst;
     struct crypto_alg* alg;
     int err;
@@ -501,7 +501,7 @@ static struct crypto_instance* crypto_gaes_ecb_alloc(struct rtattr** tb) {
     if (IS_ERR(alg))
         return ERR_CAST(alg);
 
-    inst = crypto_alloc_instance("gaes_ecb", alg);
+    inst = crypto_alloc_instance("gecb", alg);
     if (IS_ERR(inst)) {
         g_log(KGPU_LOG_ERROR, "cannot alloc crypto instance\n");
         goto out_put_alg;
@@ -516,56 +516,56 @@ static struct crypto_instance* crypto_gaes_ecb_alloc(struct rtattr** tb) {
     inst->alg.cra_blkcipher.min_keysize = alg->cra_cipher.cia_min_keysize;
     inst->alg.cra_blkcipher.max_keysize = alg->cra_cipher.cia_max_keysize;
 
-    inst->alg.cra_ctxsize = sizeof(struct crypto_gaes_ecb_ctx);
+    inst->alg.cra_ctxsize = sizeof(struct crypto_gecb_ctx);
 
-    inst->alg.cra_init = crypto_gaes_ecb_init_tfm;
-    inst->alg.cra_exit = crypto_gaes_ecb_exit_tfm;
+    inst->alg.cra_init = crypto_gecb_init_tfm;
+    inst->alg.cra_exit = crypto_gecb_exit_tfm;
 
-    inst->alg.cra_blkcipher.setkey = crypto_gaes_ecb_setkey;
-    inst->alg.cra_blkcipher.encrypt = crypto_gaes_ecb_encrypt;
-    inst->alg.cra_blkcipher.decrypt = crypto_gaes_ecb_decrypt;
+    inst->alg.cra_blkcipher.setkey = crypto_gecb_setkey;
+    inst->alg.cra_blkcipher.encrypt = crypto_gecb_encrypt;
+    inst->alg.cra_blkcipher.decrypt = crypto_gecb_decrypt;
 
 out_put_alg:
     crypto_mod_put(alg);
     return inst;
 }
 
-static void crypto_gaes_ecb_free(struct crypto_instance* inst) {
+static void crypto_gecb_free(struct crypto_instance* inst) {
     crypto_drop_spawn(crypto_instance_ctx(inst));
     kfree(inst);
 }
 
-static struct crypto_template crypto_gaes_ecb_tmpl = {
-    .name = "gaes_ecb",
-    .alloc = crypto_gaes_ecb_alloc,
-    .free = crypto_gaes_ecb_free,
+static struct crypto_template crypto_gecb_tmpl = {
+    .name = "gecb",
+    .alloc = crypto_gecb_alloc,
+    .free = crypto_gecb_free,
     .module = THIS_MODULE,
 };
 
 #include "../gaes_test.c"
 
-long test_gaes_ecb(size_t sz, int enc) {
-    return test_gaes(sz, enc, "gaes_ecb(aes)");
+long test_gecb(size_t sz, int enc) {
+    return test_gaes(sz, enc, "gecb(aes)");
 }
-EXPORT_SYMBOL_GPL(test_gaes_ecb);
+EXPORT_SYMBOL_GPL(test_gecb);
 
-static int __init crypto_gaes_ecb_module_init(void) {
+static int __init crypto_gecb_module_init(void) {
     if (!split_threshold) {
         g_log(KGPU_LOG_ERROR, "incorrect split_threshold parameter %u\n",
               split_threshold);
         split_threshold = 1;
     }
     g_log(KGPU_LOG_PRINT, "module load\n");
-    return crypto_register_template(&crypto_gaes_ecb_tmpl);
+    return crypto_register_template(&crypto_gecb_tmpl);
 }
 
-static void __exit crypto_gaes_ecb_module_exit(void) {
+static void __exit crypto_gecb_module_exit(void) {
     g_log(KGPU_LOG_PRINT, "module unload\n");
-    crypto_unregister_template(&crypto_gaes_ecb_tmpl);
+    crypto_unregister_template(&crypto_gecb_tmpl);
 }
 
-module_init(crypto_gaes_ecb_module_init);
-module_exit(crypto_gaes_ecb_module_exit);
+module_init(crypto_gecb_module_init);
+module_exit(crypto_gecb_module_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("gaes_ecb block cipher algorithm");
+MODULE_DESCRIPTION("gecb block cipher algorithm");

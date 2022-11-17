@@ -22,17 +22,17 @@
 // char* AES_ASM = "ecb(aes-asm)";
 // char* AES = "ecb(aes)";
 
-// char* AES_GPU_GENERIC = "gaes_ecb(aes-generic)";
-// char* AES_GPU_ASM = "gaes_ecb(aes-asm)";
-// char* AES_GPU = "gaes_ecb(aes)";
+// char* AES_GPU_GENERIC = "gecb(aes-generic)";
+// char* AES_GPU_ASM = "gecb(aes-asm)";
+// char* AES_GPU = "gecb(aes)";
 
 char* AES_GENERIC = "xts(aes-generic)";
 char* AES_ASM = "xts(aes-asm)";
 char* AES = "xts(aes)";
 
-char* AES_GPU_GENERIC = "gaes_xts(aes-generic)";
-char* AES_GPU_ASM = "gaes_xts(aes-asm)";
-char* AES_GPU = "gaes_xts(aes)";
+char* AES_GPU_GENERIC = "gxts(aes-generic)";
+char* AES_GPU_ASM = "gxts(aes-asm)";
+char* AES_GPU = "gxts(aes)";
 
 char* CIPHER;
 

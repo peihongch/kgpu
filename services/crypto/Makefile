@@ -1,5 +1,5 @@
-SUBDIRS = libsrv_gaes dm-crypt gaes_xts
-# SUBDIRS = callaes ecryptfs gaes_ctr libsrv_gaes dm-crypt gaes_ecb gaes_xts
+SUBDIRS = libsrv_gaes gxts ghmac gauthenc
+# SUBDIRS = callaes libsrv_gaes gauthenc ghmac gecb gctr gxts
 
 all: $(SUBDIRS)
 

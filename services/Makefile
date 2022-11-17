@@ -1,5 +1,5 @@
-SUBDIRS = gaes 
-# SUBDIRS = gaes test raid6
+SUBDIRS = crypto dm-security
+# SUBDIRS = crypto dm-security ecryptfs raid6 test
 
 all: $(SUBDIRS)
 

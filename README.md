@@ -26,7 +26,7 @@ As for copyright license, we use GPLv2.
 - RAID6 PQ computing function added as a service, gpq module for its kernel part to replace the global raid6_call algorithm with GPU one, it can beat the fastest SSE version  with 16 disks and >= 1MB data on my machine. Try it with a RAID6 on dm driver.
 - Scripts to run and stop kgpu.
 - Simple build system.
-- dm-crypt can use gaes_ecb, gaes_ctr or gaes_xts directly.
+- dm-security can use gecb, gctr or gxts directly.
 
 ## Try it?
 

@@ -1,6 +1,4 @@
 #!/bin/sh
 
-# rmmod gaes_ecb && \
-# rmmod gaes_ctr && \
-rmmod gaes_xts && \
+rmmod gxts && \
 rmmod kgpu

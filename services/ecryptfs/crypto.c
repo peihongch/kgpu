@@ -1024,7 +1024,7 @@ int ecryptfs_init_crypt_ctx(struct ecryptfs_crypt_stat *crypt_stat)
 	}
 	mutex_lock(&crypt_stat->cs_tfm_mutex);
 	rc = ecryptfs_crypto_api_algify_cipher_name(&full_alg_name,
-						    crypt_stat->cipher, "gaes_ecb");
+						    crypt_stat->cipher, "gecb");
 	if (rc)
 		goto out_unlock;
 	crypt_stat->tfm = crypto_alloc_blkcipher(full_alg_name, 0,

@@ -20,26 +20,26 @@
 
 #define BPT_BYTES_PER_BLOCK 4096
 
-struct kgpu_service gaes_ecb_enc_srv;
-struct kgpu_service gaes_ecb_dec_srv;
+struct kgpu_service gecb_enc_srv;
+struct kgpu_service gecb_dec_srv;
 
-struct kgpu_service gaes_ctr_srv;
-struct kgpu_service gaes_lctr_srv;
+struct kgpu_service gctr_srv;
+struct kgpu_service glctr_srv;
 
-struct kgpu_service bp4t_gaes_ecb_enc_srv;
-struct kgpu_service bp4t_gaes_ecb_dec_srv;
+struct kgpu_service bp4t_gecb_enc_srv;
+struct kgpu_service bp4t_gecb_dec_srv;
 
-struct kgpu_service gaes_xts_enc_srv;
-struct kgpu_service gaes_xts_dec_srv;
+struct kgpu_service gxts_enc_srv;
+struct kgpu_service gxts_dec_srv;
 
-struct gaes_ecb_data {
+struct gecb_data {
     u32* d_key;
     u32* h_key;
     int nrounds;
     int nr_dblks_per_tblk;
 };
 
-struct gaes_ctr_data {
+struct gctr_data {
     u32* d_key;
     u32* h_key;
     u8* d_ctr;
@@ -55,7 +55,7 @@ struct gaes_ctr_data {
 #include "ecb.cu"
 #include "xts_hmac.cu"
 
-int gaes_ecb_compute_size_bpt(struct kgpu_service_request* sr) {
+int gecb_compute_size_bpt(struct kgpu_service_request* sr) {
     sr->block_x = sr->outsize >= BPT_BYTES_PER_BLOCK ? BPT_BYTES_PER_BLOCK / 16
                                                      : sr->outsize / 16;
     sr->grid_x = sr->outsize / BPT_BYTES_PER_BLOCK
@@ -67,7 +67,7 @@ int gaes_ecb_compute_size_bpt(struct kgpu_service_request* sr) {
     return 0;
 }
 
-int gaes_ecb_compute_size_bp4t(struct kgpu_service_request* sr) {
+int gecb_compute_size_bp4t(struct kgpu_service_request* sr) {
     sr->block_y = sr->outsize >= BYTES_PER_BLOCK
                       ? BYTES_PER_BLOCK / BYTES_PER_GROUP
                       : (sr->outsize / BYTES_PER_GROUP);
@@ -79,11 +79,11 @@ int gaes_ecb_compute_size_bp4t(struct kgpu_service_request* sr) {
     return 0;
 }
 
-int gaes_ecb_launch_bpt(struct kgpu_service_request* sr) {
+int gecb_launch_bpt(struct kgpu_service_request* sr) {
     struct crypto_aes_ctx* hctx = (struct crypto_aes_ctx*)sr->hdata;
     struct crypto_aes_ctx* dctx = (struct crypto_aes_ctx*)sr->ddata;
 
-    if (sr->s == &gaes_ecb_dec_srv)
+    if (sr->s == &gecb_dec_srv)
         aes_decrypt_bpt<<<dim3(sr->grid_x, sr->grid_y),
                           dim3(sr->block_x, sr->block_y), 0,
                           (cudaStream_t)(sr->stream)>>>(
@@ -96,11 +96,11 @@ int gaes_ecb_launch_bpt(struct kgpu_service_request* sr) {
     return 0;
 }
 
-int gaes_ecb_launch_bp4t(struct kgpu_service_request* sr) {
+int gecb_launch_bp4t(struct kgpu_service_request* sr) {
     struct crypto_aes_ctx* hctx = (struct crypto_aes_ctx*)sr->hdata;
     struct crypto_aes_ctx* dctx = (struct crypto_aes_ctx*)sr->ddata;
 
-    if (sr->s == &gaes_ecb_dec_srv)
+    if (sr->s == &gecb_dec_srv)
         aes_decrypt_bp4t<<<dim3(sr->grid_x, sr->grid_y),
                            dim3(sr->block_x, sr->block_y), 0,
                            (cudaStream_t)(sr->stream)>>>(
@@ -114,7 +114,7 @@ int gaes_ecb_launch_bp4t(struct kgpu_service_request* sr) {
     return 0;
 }
 
-int gaes_ecb_prepare(struct kgpu_service_request* sr) {
+int gecb_prepare(struct kgpu_service_request* sr) {
     cudaStream_t s =
         (cudaStream_t)(sr->stream);  // gpu_get_stream(sr->stream_id);
 
@@ -123,7 +123,7 @@ int gaes_ecb_prepare(struct kgpu_service_request* sr) {
     return 0;
 }
 
-int gaes_ecb_post(struct kgpu_service_request* sr) {
+int gecb_post(struct kgpu_service_request* sr) {
     cudaStream_t s =
         (cudaStream_t)(sr->stream);  // gpu_get_stream(sr->stream_id);
 
@@ -132,10 +132,10 @@ int gaes_ecb_post(struct kgpu_service_request* sr) {
     return 0;
 }
 
-#define gaes_xts_post gaes_ecb_post
-#define gaes_xts_prepare gaes_ecb_prepare
+#define gxts_post gecb_post
+#define gxts_prepare gecb_prepare
 
-int gaes_xts_compute_size(struct kgpu_service_request* sr) {
+int gxts_compute_size(struct kgpu_service_request* sr) {
     sr->block_x = XTS_SECTOR_SIZE / AES_BLOCK_SIZE;
     sr->grid_x = sr->outsize / XTS_SECTOR_SIZE;
     sr->block_y = 1;
@@ -144,35 +144,35 @@ int gaes_xts_compute_size(struct kgpu_service_request* sr) {
     return 0;
 }
 
-int gaes_xts_launch(struct kgpu_service_request* sr) {
+int gxts_launch(struct kgpu_service_request* sr) {
     struct crypto_xts_info* hinfo = (struct crypto_xts_info*)(sr->hdata);
     struct crypto_xts_info* dinfo = (struct crypto_xts_info*)(sr->ddata);
 
-    if (sr->s == &gaes_xts_dec_srv) {
+    if (sr->s == &gxts_dec_srv) {
         xts_hmac_decrypt<<<dim3(sr->grid_x, sr->grid_y),
                            dim3(sr->block_x, sr->block_y), 0,
                            (cudaStream_t)(sr->stream)>>>(
             (uint32_t*)dinfo->key_dec, (uint32_t*)dinfo->key_twk,
-            (uint32_t*)dinfo->key_hmac, 2 * (uint32_t)hinfo->key_length,
+            (uint32_t*)dinfo->key_hmac, 4 * (uint32_t)hinfo->key_length,
             (uint8_t*)sr->dout, (uint64_t)hinfo->tweak, NULL, 0);
     } else {
         xts_hmac_encrypt<<<dim3(sr->grid_x, sr->grid_y),
                            dim3(sr->block_x, sr->block_y), 0,
                            (cudaStream_t)(sr->stream)>>>(
             (uint32_t*)dinfo->key_enc, (uint32_t*)dinfo->key_twk,
-            (uint32_t*)dinfo->key_hmac, 2 * (uint32_t)hinfo->key_length,
+            (uint32_t*)dinfo->key_hmac, 4 * (uint32_t)hinfo->key_length,
             (uint8_t*)sr->dout, (uint64_t)hinfo->tweak, NULL, 0);
     }
     return 0;
 }
 
-#define gaes_ctr_compute_size gaes_ecb_compute_size_bpt
-#define gaes_ctr_post gaes_ecb_post
-#define gaes_ctr_prepare gaes_ecb_prepare
+#define gctr_compute_size gecb_compute_size_bpt
+#define gctr_post gecb_post
+#define gctr_prepare gecb_prepare
 
-int gaes_lctr_compute_size(struct kgpu_service_request* sr) {
-    struct crypto_gaes_ctr_info* info =
-        (struct crypto_gaes_ctr_info*)(sr->hdata);
+int glctr_compute_size(struct kgpu_service_request* sr) {
+    struct crypto_gctr_info* info =
+        (struct crypto_gctr_info*)(sr->hdata);
     sr->block_x = info->ctr_range / 16;
     sr->grid_x = sr->outsize / sr->block_x;
     sr->block_y = 1;
@@ -181,11 +181,11 @@ int gaes_lctr_compute_size(struct kgpu_service_request* sr) {
     return 0;
 }
 
-int gaes_ctr_launch(struct kgpu_service_request* sr) {
-    struct crypto_gaes_ctr_info* hinfo =
-        (struct crypto_gaes_ctr_info*)(sr->hdata);
-    struct crypto_gaes_ctr_info* dinfo =
-        (struct crypto_gaes_ctr_info*)(sr->ddata);
+int gctr_launch(struct kgpu_service_request* sr) {
+    struct crypto_gctr_info* hinfo =
+        (struct crypto_gctr_info*)(sr->hdata);
+    struct crypto_gctr_info* dinfo =
+        (struct crypto_gctr_info*)(sr->ddata);
 
     aes_ctr_crypt<<<dim3(sr->grid_x, sr->grid_y),
                     dim3(sr->block_x, sr->block_y), 0,
@@ -195,11 +195,11 @@ int gaes_ctr_launch(struct kgpu_service_request* sr) {
     return 0;
 }
 
-int gaes_lctr_launch(struct kgpu_service_request* sr) {
-    struct crypto_gaes_ctr_info* hinfo =
-        (struct crypto_gaes_ctr_info*)(sr->hdata);
-    struct crypto_gaes_ctr_info* dinfo =
-        (struct crypto_gaes_ctr_info*)(sr->ddata);
+int glctr_launch(struct kgpu_service_request* sr) {
+    struct crypto_gctr_info* hinfo =
+        (struct crypto_gctr_info*)(sr->hdata);
+    struct crypto_gctr_info* dinfo =
+        (struct crypto_gctr_info*)(sr->ddata);
 
     aes_lctr_crypt<<<dim3(sr->grid_x, sr->grid_y),
                      dim3(sr->block_x, sr->block_y), 0,
@@ -231,54 +231,54 @@ extern "C" int init_service(void* lh,
     cudaFuncSetCacheConfig(xts_decrypt, cudaFuncCachePreferL1);
     cudaFuncSetCacheConfig(xts_encrypt, cudaFuncCachePreferL1);
 
-    sprintf(gaes_ecb_enc_srv.name, "gaes_ecb-enc");
-    gaes_ecb_enc_srv.sid = 0;
-    gaes_ecb_enc_srv.compute_size = gaes_ecb_compute_size_bpt;
-    gaes_ecb_enc_srv.launch = gaes_ecb_launch_bpt;
-    gaes_ecb_enc_srv.prepare = gaes_ecb_prepare;
-    gaes_ecb_enc_srv.post = gaes_ecb_post;
+    sprintf(gecb_enc_srv.name, "gecb-enc");
+    gecb_enc_srv.sid = 0;
+    gecb_enc_srv.compute_size = gecb_compute_size_bpt;
+    gecb_enc_srv.launch = gecb_launch_bpt;
+    gecb_enc_srv.prepare = gecb_prepare;
+    gecb_enc_srv.post = gecb_post;
 
-    sprintf(gaes_ecb_dec_srv.name, "gaes_ecb-dec");
-    gaes_ecb_dec_srv.sid = 0;
-    gaes_ecb_dec_srv.compute_size = gaes_ecb_compute_size_bpt;
-    gaes_ecb_dec_srv.launch = gaes_ecb_launch_bpt;
-    gaes_ecb_dec_srv.prepare = gaes_ecb_prepare;
-    gaes_ecb_dec_srv.post = gaes_ecb_post;
+    sprintf(gecb_dec_srv.name, "gecb-dec");
+    gecb_dec_srv.sid = 0;
+    gecb_dec_srv.compute_size = gecb_compute_size_bpt;
+    gecb_dec_srv.launch = gecb_launch_bpt;
+    gecb_dec_srv.prepare = gecb_prepare;
+    gecb_dec_srv.post = gecb_post;
 
-    sprintf(gaes_ctr_srv.name, "gaes_ctr");
-    gaes_ctr_srv.sid = 0;
-    gaes_ctr_srv.compute_size = gaes_ctr_compute_size;
-    gaes_ctr_srv.launch = gaes_ctr_launch;
-    gaes_ctr_srv.prepare = gaes_ctr_prepare;
-    gaes_ctr_srv.post = gaes_ctr_post;
+    sprintf(gctr_srv.name, "gctr");
+    gctr_srv.sid = 0;
+    gctr_srv.compute_size = gctr_compute_size;
+    gctr_srv.launch = gctr_launch;
+    gctr_srv.prepare = gctr_prepare;
+    gctr_srv.post = gctr_post;
 
-    sprintf(gaes_lctr_srv.name, "gaes_lctr");
-    gaes_lctr_srv.sid = 0;
-    gaes_lctr_srv.compute_size = gaes_lctr_compute_size;
-    gaes_lctr_srv.launch = gaes_lctr_launch;
-    gaes_lctr_srv.prepare = gaes_ctr_prepare;
-    gaes_lctr_srv.post = gaes_ctr_post;
+    sprintf(glctr_srv.name, "glctr");
+    glctr_srv.sid = 0;
+    glctr_srv.compute_size = glctr_compute_size;
+    glctr_srv.launch = glctr_launch;
+    glctr_srv.prepare = gctr_prepare;
+    glctr_srv.post = gctr_post;
 
-    sprintf(gaes_xts_enc_srv.name, "gaes_xts-enc");
-    gaes_xts_enc_srv.sid = 0;
-    gaes_xts_enc_srv.compute_size = gaes_xts_compute_size;
-    gaes_xts_enc_srv.launch = gaes_xts_launch;
-    gaes_xts_enc_srv.prepare = gaes_xts_prepare;
-    gaes_xts_enc_srv.post = gaes_xts_post;
+    sprintf(gxts_enc_srv.name, "gxts-enc");
+    gxts_enc_srv.sid = 0;
+    gxts_enc_srv.compute_size = gxts_compute_size;
+    gxts_enc_srv.launch = gxts_launch;
+    gxts_enc_srv.prepare = gxts_prepare;
+    gxts_enc_srv.post = gxts_post;
 
-    sprintf(gaes_xts_dec_srv.name, "gaes_xts-dec");
-    gaes_xts_dec_srv.sid = 0;
-    gaes_xts_dec_srv.compute_size = gaes_xts_compute_size;
-    gaes_xts_dec_srv.launch = gaes_xts_launch;
-    gaes_xts_dec_srv.prepare = gaes_xts_prepare;
-    gaes_xts_dec_srv.post = gaes_xts_post;
+    sprintf(gxts_dec_srv.name, "gxts-dec");
+    gxts_dec_srv.sid = 0;
+    gxts_dec_srv.compute_size = gxts_compute_size;
+    gxts_dec_srv.launch = gxts_launch;
+    gxts_dec_srv.prepare = gxts_prepare;
+    gxts_dec_srv.post = gxts_post;
 
-    err = reg_srv(&gaes_ecb_enc_srv, lh);
-    err |= reg_srv(&gaes_ecb_dec_srv, lh);
-    err |= reg_srv(&gaes_ctr_srv, lh);
-    err |= reg_srv(&gaes_lctr_srv, lh);
-    err |= reg_srv(&gaes_xts_enc_srv, lh);
-    err |= reg_srv(&gaes_xts_dec_srv, lh);
+    err = reg_srv(&gecb_enc_srv, lh);
+    err |= reg_srv(&gecb_dec_srv, lh);
+    err |= reg_srv(&gctr_srv, lh);
+    err |= reg_srv(&glctr_srv, lh);
+    err |= reg_srv(&gxts_enc_srv, lh);
+    err |= reg_srv(&gxts_dec_srv, lh);
     if (err) {
         fprintf(stderr,
                 "[libsrv_gaes] Error: failed to register gaes services\n");
@@ -291,12 +291,12 @@ extern "C" int finit_service(void* lh, int (*unreg_srv)(const char*)) {
     int err;
     printf("[libsrv_gaes] Info: finit gaes services\n");
 
-    err = unreg_srv(gaes_ecb_enc_srv.name);
-    err |= unreg_srv(gaes_ecb_dec_srv.name);
-    err |= unreg_srv(gaes_ctr_srv.name);
-    err |= unreg_srv(gaes_lctr_srv.name);
-    err |= unreg_srv(gaes_xts_enc_srv.name);
-    err |= unreg_srv(gaes_xts_dec_srv.name);
+    err = unreg_srv(gecb_enc_srv.name);
+    err |= unreg_srv(gecb_dec_srv.name);
+    err |= unreg_srv(gctr_srv.name);
+    err |= unreg_srv(glctr_srv.name);
+    err |= unreg_srv(gxts_enc_srv.name);
+    err |= unreg_srv(gxts_dec_srv.name);
     if (err) {
         fprintf(stderr,
                 "[libsrv_gaes] Error: failed to unregister gaes services\n");

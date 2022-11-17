@@ -2,6 +2,6 @@
 
 umount mnt && rmdir mnt
 
-dmsetup remove crypt1
+dmsetup remove security1
 
-rmmod dm_crypt
+rmmod dm_security

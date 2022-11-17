@@ -36,10 +36,10 @@ struct priv {
 };
 
 /* customized log function */
-#define g_log(level, ...) kgpu_do_log(level, "gaes_xts", ##__VA_ARGS__)
+#define g_log(level, ...) kgpu_do_log(level, "gxts", ##__VA_ARGS__)
 #define dbg(...) g_log(KGPU_LOG_DEBUG, ##__VA_ARGS__)
 
-struct gaes_xts_async_data {
+struct gxts_async_data {
     struct completion* c;          /* async-call completion */
     struct scatterlist *dst, *src; /* crypt destination and source */
     struct blkcipher_desc* desc;   /* cipher descriptor */
@@ -150,7 +150,7 @@ static void __done_cryption(struct blkcipher_desc* desc,
 }
 
 static int async_gpu_callback(struct kgpu_request* req) {
-    struct gaes_xts_async_data* data = (struct gaes_xts_async_data*)req->kdata;
+    struct gxts_async_data* data = (struct gxts_async_data*)req->kdata;
 
     if (!zero_copy)
         __done_cryption(data->desc, data->dst, data->src, data->sz,
@@ -290,11 +290,11 @@ static int gpu_crypt_nzc(struct blkcipher_desc* d,
     }
 
     memcpy(req->udata, &(ctx->info), sizeof(struct crypto_xts_info));
-    strcpy(req->service_name, enc ? "gaes_xts-enc" : "gaes_xts-dec");
+    strcpy(req->service_name, enc ? "gxts-enc" : "gxts-dec");
 
     if (c) {
-        struct gaes_xts_async_data* adata =
-            kmalloc(sizeof(struct gaes_xts_async_data), GFP_KERNEL);
+        struct gxts_async_data* adata =
+            kmalloc(sizeof(struct gxts_async_data), GFP_KERNEL);
         if (!adata) {
             g_log(KGPU_LOG_ERROR, "out of mem for async data\n");
             // TODO: do something here
@@ -377,7 +377,7 @@ static int gpu_crypt_zc(struct blkcipher_desc* d,
     req->udata = (void*)(addr + rsz);
 
     memcpy(data, &(ctx->info), sizeof(struct crypto_xts_info));
-    strcpy(req->service_name, enc ? "gaes_xts-enc" : "gaes_xts-dec");
+    strcpy(req->service_name, enc ? "gxts-enc" : "gxts-dec");
 
     pgoff = offset >> PAGE_SHIFT;
     n = pgoff + (rsz >> PAGE_SHIFT);
@@ -403,8 +403,8 @@ static int gpu_crypt_zc(struct blkcipher_desc* d,
         }
 
     if (c) {
-        struct gaes_xts_async_data* adata =
-            kmalloc(sizeof(struct gaes_xts_async_data), GFP_KERNEL);
+        struct gxts_async_data* adata =
+            kmalloc(sizeof(struct gxts_async_data), GFP_KERNEL);
         if (!adata) {
             g_log(KGPU_LOG_ERROR, "out of mem for async data\n");
             // TODO: do something here
@@ -515,20 +515,20 @@ static int cpu_decrypt(struct blkcipher_desc* desc,
                      crypto_cipher_alg(ctx->child)->cia_decrypt);
 }
 
-static int gaes_xts_encrypt(struct blkcipher_desc* desc,
+static int gxts_encrypt(struct blkcipher_desc* desc,
                             struct scatterlist* dst,
                             struct scatterlist* src,
                             unsigned int nbytes) {
-    if (/*nbytes%PAGE_SIZE != 0 ||*/ nbytes <= GAES_XTS_SIZE_THRESHOLD)
+    if (/*nbytes%PAGE_SIZE != 0 ||*/ nbytes <= GXTS_SIZE_THRESHOLD)
         return cpu_encrypt(desc, dst, src, nbytes);
     return gpu_crypt(desc, dst, src, nbytes, 1);
 }
 
-static int gaes_xts_decrypt(struct blkcipher_desc* desc,
+static int gxts_decrypt(struct blkcipher_desc* desc,
                             struct scatterlist* dst,
                             struct scatterlist* src,
                             unsigned int nbytes) {
-    if (/*nbytes%PAGE_SIZE != 0 ||*/ nbytes <= GAES_XTS_SIZE_THRESHOLD)
+    if (/*nbytes%PAGE_SIZE != 0 ||*/ nbytes <= GXTS_SIZE_THRESHOLD)
         return cpu_decrypt(desc, dst, src, nbytes);
     return gpu_crypt(desc, dst, src, nbytes, 0);
 }
@@ -590,7 +590,7 @@ static struct crypto_instance* alloc(struct rtattr** tb) {
     if (IS_ERR(alg))
         return ERR_CAST(alg);
 
-    inst = crypto_alloc_instance("gaes_xts", alg);
+    inst = crypto_alloc_instance("gxts", alg);
     if (IS_ERR(inst))
         goto out_put_alg;
 
@@ -615,8 +615,8 @@ static struct crypto_instance* alloc(struct rtattr** tb) {
     inst->alg.cra_exit = exit_tfm;
 
     inst->alg.cra_blkcipher.setkey = setkey;
-    inst->alg.cra_blkcipher.encrypt = gaes_xts_encrypt;
-    inst->alg.cra_blkcipher.decrypt = gaes_xts_decrypt;
+    inst->alg.cra_blkcipher.encrypt = gxts_encrypt;
+    inst->alg.cra_blkcipher.decrypt = gxts_decrypt;
 
 out_put_alg:
     crypto_mod_put(alg);
@@ -629,7 +629,7 @@ static void free(struct crypto_instance* inst) {
 }
 
 static struct crypto_template crypto_tmpl = {
-    .name = "gaes_xts",
+    .name = "gxts",
     .alloc = alloc,
     .free = free,
     .module = THIS_MODULE,
@@ -654,4 +654,4 @@ module_init(crypto_module_init);
 module_exit(crypto_module_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("GAES_XTS block cipher mode");
+MODULE_DESCRIPTION("XTS block cipher mode (GPU version)");

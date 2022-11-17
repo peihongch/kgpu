@@ -13,12 +13,12 @@
 #define HMAC_MAX_KEYLENGTH (64)  // 512 bits - 64 bytes
 #define HMAC_MAX_KEYLENGTH_U32 (HMAC_MAX_KEYLENGTH / sizeof(u32))
 
-struct crypto_gaes_ctr_config {
+struct crypto_gctr_config {
     u32 key_length;
     u32 ctr_range;
 };
 
-struct crypto_gaes_ctr_info {
+struct crypto_gctr_info {
     u32 key_enc[AES_MAX_KEYLENGTH_U32];
     u32 key_dec[AES_MAX_KEYLENGTH_U32];
     u32 key_length;
