@@ -4,7 +4,7 @@ modprobe dm_mod
 insmod ./dm-security.ko
 
 # Create a security device using dmsetup
-dmsetup create security1 --table "0 `blockdev --getsz $1` security babebabebabebabebabebabebabebabebabebabebabebabebabebabebabebabe $1 0"
+dmsetup create security1 --table "0 `blockdev --getsz $1` security 123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0 $1 0"
 
 mkfs.btrfs /dev/mapper/security1 -f
 mkdir -p mnt

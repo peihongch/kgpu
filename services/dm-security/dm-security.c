@@ -8,7 +8,9 @@
 
 #include <asm/page.h>
 #include <asm/unaligned.h>
+#include <crypto/aead.h>
 #include <crypto/algapi.h>
+#include <crypto/authenc.h>
 #include <crypto/hash.h>
 #include <crypto/md5.h>
 #include <linux/atomic.h>
@@ -23,6 +25,7 @@
 #include <linux/mempool.h>
 #include <linux/module.h>
 #include <linux/percpu.h>
+#include <linux/rtnetlink.h> /* for struct rtattr and RTA macros only */
 #include <linux/scatterlist.h>
 #include <linux/slab.h>
 #include <linux/workqueue.h>
@@ -31,9 +34,13 @@
 
 #define DM_MSG_PREFIX "security"
 #define DEFAULT_CIPHER "aes"
-#define DEFAULT_CHAINMODE "gxts"
+#define DEFAULT_CHAINMODE "xts"
 #define DEFAULT_IVMODE "plain64"
-#define CIPHERMODE (DEFAULT_CHAINMODE "(" DEFAULT_CIPHER ")")
+#define DEFAULT_HASH "sha512"
+#define CIPHERMODE DEFAULT_CHAINMODE "(" DEFAULT_CIPHER ")"
+#define HMAC "hmac(" DEFAULT_HASH ")"
+#define AUTHCIPHER "gauthenc(" HMAC "," CIPHERMODE ")"
+#define AUTHSIZE 64
 
 /*
  * context holding the current state of a multi-part conversion
@@ -68,8 +75,9 @@ struct dm_crypt_io {
 
 struct dm_crypt_request {
     struct convert_context* ctx;
-    struct scatterlist sg_in;
-    struct scatterlist sg_out;
+    struct scatterlist sg_in[2];
+    struct scatterlist sg_out[2];
+    struct scatterlist sg_assoc;
     sector_t iv_sector;
 };
 
@@ -91,7 +99,7 @@ enum flags { DM_CRYPT_SUSPENDED, DM_CRYPT_KEY_VALID };
  * Duplicated per-CPU state for cipher.
  */
 struct crypt_cpu {
-    struct ablkcipher_request* req;
+    struct aead_request* req;
 };
 
 /*
@@ -114,7 +122,6 @@ struct crypt_config {
     struct workqueue_struct* io_queue;
     struct workqueue_struct* crypt_queue;
 
-    char* cipher;
     char* cipher_string;
 
     struct crypt_iv_operations* iv_gen_ops;
@@ -126,12 +133,12 @@ struct crypt_config {
      */
     struct crypt_cpu __percpu* cpu;
 
-    struct crypto_ablkcipher* tfm;
+    struct crypto_aead* tfm;
 
     /*
      * Layout of each crypto request:
      *
-     *   struct ablkcipher_request
+     *   struct aead_request
      *      context
      *      padding
      *   struct dm_crypt_request
@@ -145,6 +152,9 @@ struct crypt_config {
 
     unsigned long flags;
     unsigned int key_size;
+    unsigned int key_mac_size; /* MAC key size for authenc(...) */
+
+    u8* authenc_key; /* space for keys in authenc() format (if used) */
     u8 key[0];
 };
 
@@ -225,19 +235,18 @@ static void crypt_convert_init(struct crypt_config* cc,
 }
 
 static struct dm_crypt_request* dmreq_of_req(struct crypt_config* cc,
-                                             struct ablkcipher_request* req) {
+                                             void* req) {
     return (struct dm_crypt_request*)((char*)req + cc->dmreq_start);
 }
 
-static struct ablkcipher_request* req_of_dmreq(struct crypt_config* cc,
-                                               struct dm_crypt_request* dmreq) {
-    return (struct ablkcipher_request*)((char*)dmreq - cc->dmreq_start);
+static struct aead_request* req_of_dmreq(struct crypt_config* cc,
+                                         struct dm_crypt_request* dmreq) {
+    return (struct aead_request*)((char*)dmreq - cc->dmreq_start);
 }
 
 static u8* iv_of_dmreq(struct crypt_config* cc,
                        struct dm_crypt_request* dmreq) {
-    return (u8*)ALIGN((unsigned long)(dmreq + 1),
-                      crypto_ablkcipher_alignmask(cc->tfm) + 1);
+    return (u8*)(dmreq + 1);
 }
 
 /*
@@ -307,6 +316,80 @@ static int crypt_convert_blocks(struct crypt_config* cc,
     return r;
 }
 
+static int crypt_convert_block(struct crypt_config* cc,
+                               struct convert_context* ctx,
+                               struct aead_request* req) {
+    struct bio_vec* bv_in = bio_iovec_idx(ctx->bio_in, ctx->idx_in);
+    struct bio_vec* bv_out = bio_iovec_idx(ctx->bio_out, ctx->idx_out);
+    struct dm_crypt_request* dmreq;
+    u8 *iv, *tag;
+    uint64_t* assoc = 0;
+    unsigned int tag_size = AUTHSIZE;
+    unsigned int assoclen = sizeof(uint64_t);
+    int r;
+
+    dmreq = dmreq_of_req(cc, req);
+    iv = iv_of_dmreq(cc, dmreq);
+
+    dmreq->iv_sector = ctx->cc_sector;
+    dmreq->ctx = ctx;
+
+    assoc = (uint64_t*)kzalloc(assoclen, GFP_KERNEL);
+    if (!assoc)
+        DMERR("Cannot allocate assoc buffer");
+
+    tag = (u8*)kzalloc(tag_size, GFP_KERNEL);
+    if (!tag)
+        DMERR("Cannot allocate tag buffer");
+
+    sg_init_table(dmreq->sg_in, 2);
+    sg_set_page(&dmreq->sg_in[0], bv_in->bv_page, (1 << SECTOR_SHIFT),
+                bv_in->bv_offset + ctx->offset_in);
+    sg_set_buf(&dmreq->sg_in[1], tag, tag_size);
+
+    sg_init_table(dmreq->sg_out, 2);
+    sg_set_page(&dmreq->sg_out[0], bv_out->bv_page, (1 << SECTOR_SHIFT),
+                bv_out->bv_offset + ctx->offset_out);
+    sg_set_buf(&dmreq->sg_out[1], tag, tag_size);
+
+    sg_init_one(&dmreq->sg_assoc, assoc, assoclen);
+
+    ctx->offset_in += 1 << SECTOR_SHIFT;
+    if (ctx->offset_in >= bv_in->bv_len) {
+        ctx->offset_in = 0;
+        ctx->idx_in++;
+    }
+
+    ctx->offset_out += 1 << SECTOR_SHIFT;
+    if (ctx->offset_out >= bv_out->bv_len) {
+        ctx->offset_out = 0;
+        ctx->idx_out++;
+    }
+
+    if (cc->iv_gen_ops) {
+        r = cc->iv_gen_ops->generator(cc, iv, dmreq);
+        if (r < 0)
+            return r;
+    }
+
+    aead_request_set_assoc(req, &dmreq->sg_assoc, assoclen);
+    if (bio_data_dir(ctx->bio_in) == WRITE) {
+        aead_request_set_crypt(req, dmreq->sg_in, dmreq->sg_out,
+                               (1 << SECTOR_SHIFT), iv);
+        r = crypto_aead_encrypt(req);
+    } else {
+        aead_request_set_crypt(req, dmreq->sg_in, dmreq->sg_out,
+                               (1 << SECTOR_SHIFT) + tag_size, iv);
+        r = crypto_aead_decrypt(req);
+    }
+
+    if (r == -EBADMSG)
+        DMERR_LIMIT("INTEGRITY AEAD ERROR, sector %llu",
+                    (unsigned long long)le64_to_cpu(ctx->cc_sector));
+
+    return r;
+}
+
 static void kcryptd_async_done(struct crypto_async_request* async_req,
                                int error);
 
@@ -317,8 +400,8 @@ static void crypt_alloc_req(struct crypt_config* cc,
     if (!this_cc->req)
         this_cc->req = mempool_alloc(cc->req_pool, GFP_NOIO);
 
-    ablkcipher_request_set_tfm(this_cc->req, cc->tfm);
-    ablkcipher_request_set_callback(
+    aead_request_set_tfm(this_cc->req, cc->tfm);
+    aead_request_set_callback(
         this_cc->req, CRYPTO_TFM_REQ_MAY_BACKLOG | CRYPTO_TFM_REQ_MAY_SLEEP,
         kcryptd_async_done, dmreq_of_req(cc, this_cc->req));
 }
@@ -338,25 +421,44 @@ static int crypt_convert(struct crypt_config* cc, struct convert_context* ctx) {
 
         atomic_inc(&ctx->cc_pending);
 
-        r = crypt_convert_blocks(cc, ctx, this_cc->req);
+        // r = crypt_convert_blocks(cc, ctx, this_cc->req);
+        r = crypt_convert_block(cc, ctx, this_cc->req);
 
         switch (r) {
             /* async */
+            /*
+             * The request was queued by a crypto driver
+             * but the driver request queue is full, let's wait.
+             */
             case -EBUSY:
                 wait_for_completion(&ctx->restart);
                 INIT_COMPLETION(ctx->restart);
                 /* fall through*/
+            /*
+             * The request is queued and processed asynchronously,
+             * completion function kcryptd_async_done() will be called.
+             */
             case -EINPROGRESS:
                 this_cc->req = NULL;
                 ctx->cc_sector++;
                 continue;
 
             /* sync */
+            /*
+             * The request was already processed (synchronously).
+             */
             case 0:
                 atomic_dec(&ctx->cc_pending);
                 ctx->cc_sector++;
                 cond_resched();
                 continue;
+
+            /*
+             * There was a data integrity error.
+             */
+            case -EBADMSG:
+                atomic_dec(&ctx->cc_pending);
+                return -EILSEQ;
 
             /* error */
             default:
@@ -728,8 +830,8 @@ static void kcryptd_async_done(struct crypto_async_request* async_req,
         return;
     }
 
-    if (error < 0)
-        io->error = -EIO;
+    // if (error < 0)
+    //     io->error = -EIO;
 
     mempool_free(req_of_dmreq(cc, dmreq), cc->req_pool);
 
@@ -763,7 +865,7 @@ static void crypt_free_tfm(struct crypt_config* cc) {
         return;
 
     if (cc->tfm && !IS_ERR(cc->tfm)) {
-        crypto_free_ablkcipher(cc->tfm);
+        crypto_free_aead(cc->tfm);
         cc->tfm = NULL;
     }
 }
@@ -771,7 +873,7 @@ static void crypt_free_tfm(struct crypt_config* cc) {
 static int crypt_alloc_tfm(struct crypt_config* cc, char* ciphermode) {
     int err;
 
-    cc->tfm = crypto_alloc_ablkcipher(ciphermode, 0, 0);
+    cc->tfm = crypto_alloc_aead(ciphermode, 0, 0);
     if (IS_ERR(cc->tfm)) {
         err = PTR_ERR(cc->tfm);
         crypt_free_tfm(cc);
@@ -781,12 +883,46 @@ static int crypt_alloc_tfm(struct crypt_config* cc, char* ciphermode) {
     return 0;
 }
 
+static unsigned crypt_authenckey_size(struct crypt_config* cc) {
+    return cc->key_size + RTA_SPACE(sizeof(struct crypto_authenc_key_param));
+}
+
+/*
+ * If AEAD is composed like authenc(hmac(sha512),xts(aes)),
+ * the key must be for some reason in special format.
+ * This funcion converts cc->key to this special format.
+ *
+ * | rta length | rta type | enckey length | authkey | enckey |
+ *         ↑        ↑              ↑
+ *      (little endian)      (big endian)
+ */
+static void crypt_copy_authenckey(char* p,
+                                  const void* key,
+                                  unsigned enckeylen,
+                                  unsigned authkeylen) {
+    struct crypto_authenc_key_param* param;
+    struct rtattr* rta;
+
+    rta = (struct rtattr*)p;
+    param = RTA_DATA(rta);
+    param->enckeylen = cpu_to_be32(enckeylen);
+    rta->rta_len = RTA_LENGTH(sizeof(*param));
+    rta->rta_type = CRYPTO_AUTHENC_KEYA_PARAM;
+    p += RTA_SPACE(sizeof(*param));
+    memcpy(p, key + enckeylen, authkeylen);
+    p += authkeylen;
+    memcpy(p, key, enckeylen);
+}
+
 static int crypt_setkey_allcpus(struct crypt_config* cc) {
     int err = 0, r;
 
-    r = crypto_ablkcipher_setkey(cc->tfm, cc->key, cc->key_size);
+    crypt_copy_authenckey(cc->authenc_key, cc->key,
+                          cc->key_size - cc->key_mac_size, cc->key_mac_size);
+    r = crypto_aead_setkey(cc->tfm, cc->authenc_key, crypt_authenckey_size(cc));
     if (r)
         err = r;
+    memzero_explicit(cc->authenc_key, crypt_authenckey_size(cc));
 
     return err;
 }
@@ -864,11 +1000,32 @@ static void crypt_dtr(struct dm_target* ti) {
     if (cc->cpu)
         free_percpu(cc->cpu);
 
-    kzfree(cc->cipher);
     kzfree(cc->cipher_string);
 
     /* Must zero key material before freeing */
     kzfree(cc);
+}
+
+/*
+ * Workaround to parse HMAC algorithm from AEAD crypto API spec.
+ * The HMAC is needed to calculate tag size (HMAC digest size).
+ * This should be probably done by crypto-api calls (once available...)
+ */
+static int crypt_ctr_auth_cipher(struct crypt_config* cc, char* mac_alg) {
+    struct crypto_ahash* mac;
+
+    mac = crypto_alloc_ahash(mac_alg, 0, 0);
+    if (IS_ERR(mac))
+        return PTR_ERR(mac);
+
+    cc->key_mac_size = crypto_ahash_digestsize(mac);
+    crypto_free_ahash(mac);
+
+    cc->authenc_key = kmalloc(crypt_authenckey_size(cc), GFP_KERNEL);
+    if (!cc->authenc_key)
+        return -ENOMEM;
+
+    return 0;
 }
 
 static int crypt_ctr_cipher(struct dm_target* ti, char* key) {
@@ -876,12 +1033,8 @@ static int crypt_ctr_cipher(struct dm_target* ti, char* key) {
     const char* ivmode = DEFAULT_IVMODE;
     int ret = -EINVAL;
 
-    cc->cipher_string = kstrdup(CIPHERMODE, GFP_KERNEL);
+    cc->cipher_string = kstrdup(AUTHCIPHER, GFP_KERNEL);
     if (!cc->cipher_string)
-        goto bad_mem;
-
-    cc->cipher = kstrdup(DEFAULT_CIPHER, GFP_KERNEL);
-    if (!cc->cipher)
         goto bad_mem;
 
     cc->cpu = __alloc_percpu(sizeof(*(cc->cpu)), __alignof__(struct crypt_cpu));
@@ -891,12 +1044,24 @@ static int crypt_ctr_cipher(struct dm_target* ti, char* key) {
     }
 
     /* Allocate cipher */
-    printk("Cipher Mode : %s\n", CIPHERMODE);
-    ret = crypt_alloc_tfm(cc, CIPHERMODE);
+    printk("Auth Cipher : %s\n", AUTHCIPHER);
+    ret = crypt_alloc_tfm(cc, AUTHCIPHER);
     if (ret < 0) {
         ti->error = "Error allocating crypto tfm";
         goto bad;
     }
+
+    /* Alloc AEAD, can be used only in new format. */
+    ret = crypt_ctr_auth_cipher(cc, HMAC);
+    if (ret < 0) {
+        ti->error = "Invalid AEAD cipher spec";
+        return -ENOMEM;
+    }
+
+    /* Initialize IV */
+    /* at least a 64 bit sector number should fit in our buffer */
+    cc->iv_size = max(crypto_aead_ivsize(cc->tfm),
+                      (unsigned int)(sizeof(u64) / sizeof(u8)));
 
     /* Initialize and set key */
     ret = crypt_set_key(cc, key);
@@ -905,10 +1070,12 @@ static int crypt_ctr_cipher(struct dm_target* ti, char* key) {
         goto bad;
     }
 
-    /* Initialize IV */
-    /* at least a 64 bit sector number should fit in our buffer */
-    cc->iv_size = max(crypto_ablkcipher_ivsize(cc->tfm),
-                      (unsigned int)(sizeof(u64) / sizeof(u8)));
+    /* Set authsize */
+    ret = crypto_aead_setauthsize(cc->tfm, AUTHSIZE);
+    if (ret) {
+        ti->error = "Error setting authsize";
+        goto bad;
+    }
 
     /* Choose ivmode, see comments at iv code. */
     if (ivmode == NULL)
@@ -971,11 +1138,9 @@ static int crypt_ctr(struct dm_target* ti, unsigned int argc, char** argv) {
         goto bad;
     }
 
-    cc->dmreq_start = sizeof(struct ablkcipher_request);
-    cc->dmreq_start += crypto_ablkcipher_reqsize(cc->tfm);
-    cc->dmreq_start = ALIGN(cc->dmreq_start, crypto_tfm_ctx_alignment());
-    cc->dmreq_start += crypto_ablkcipher_alignmask(cc->tfm) &
-                       ~(crypto_tfm_ctx_alignment() - 1);
+    // FIXME : alignment is removed for quick development
+    cc->dmreq_start = sizeof(struct aead_request);
+    cc->dmreq_start += crypto_aead_reqsize(cc->tfm);  // tfm ctx
 
     cc->req_pool = mempool_create_kmalloc_pool(
         MIN_IOS,

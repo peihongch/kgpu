@@ -48,8 +48,12 @@ struct authenc_request_ctx {
 
 static void authenc_request_complete(struct aead_request *req, int err)
 {
-	if (err != -EINPROGRESS)
+	pr_info("authenc_request_complete: 1");
+	if (err != -EINPROGRESS){
+		pr_info("authenc_request_complete: 2");
 		aead_request_complete(req, err);
+	}
+	pr_info("authenc_request_complete: 3");
 }
 
 static int crypto_authenc_setkey(struct crypto_aead *authenc, const u8 *key,
@@ -365,17 +369,22 @@ static void crypto_authenc_encrypt_done(struct crypto_async_request *req,
 {
 	struct aead_request *areq = req->data;
 
+	pr_info("crypto_authenc_encrypt_done: 1");
 	if (!err) {
+		pr_info("crypto_authenc_encrypt_done: 2");
 		struct crypto_aead *authenc = crypto_aead_reqtfm(areq);
 		struct crypto_authenc_ctx *ctx = crypto_aead_ctx(authenc);
 		struct ablkcipher_request *abreq = aead_request_ctx(areq);
 		u8 *iv = (u8 *)(abreq + 1) +
 			 crypto_ablkcipher_reqsize(ctx->enc);
 
+		pr_info("crypto_authenc_encrypt_done: 3");
 		err = crypto_authenc_genicv(areq, iv, 0);
 	}
 
+	pr_info("crypto_authenc_encrypt_done: 4");
 	authenc_request_complete(areq, err);
+	pr_info("crypto_authenc_encrypt_done: 5");
 }
 
 static int crypto_authenc_encrypt(struct aead_request *req)
@@ -519,9 +528,10 @@ static int crypto_authenc_decrypt(struct aead_request *req)
 		return -EINVAL;
 	cryptlen -= authsize;
 
-	err = crypto_authenc_iverify(req, iv, cryptlen);
-	if (err)
-		return err;
+	// TODO : bypass tag authentication for test
+	// err = crypto_authenc_iverify(req, iv, cryptlen);
+	// if (err)
+	// 	return err;
 
 	ablkcipher_request_set_tfm(abreq, ctx->enc);
 	ablkcipher_request_set_callback(abreq, aead_request_flags(req),
