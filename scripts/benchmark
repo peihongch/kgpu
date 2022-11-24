@@ -1,0 +1,38 @@
+#!/bin/bash
+
+cat > job.fio << EOF
+[global]
+filename=/dev/mapper/secbench
+direct=1
+iodepth=128
+ioengine=libaio
+size=10g
+numjobs=1
+ramp_time=10
+runtime=60
+group_reporting
+bs=4k
+[4k-read]
+rw=read
+stonewall
+[4k-randread]
+rw=randread
+stonewall
+[4k-write]
+rw=write
+stonewall
+[4k-randwrite]
+rw=randwrite
+stonewall
+EOF
+
+modprobe dm_mod
+insmod ./dm-security.ko
+
+dmsetup create secbench --table "0 `blockdev --getsz $1` security 123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0 $1 0"
+
+fio ./job.fio
+
+dmsetup remove secbench
+rmmod dm_security
+rm -rf job.fio
