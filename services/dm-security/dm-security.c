@@ -145,6 +145,7 @@ struct security_cpu {
  */
 struct security_config {
     struct dm_dev* dev;
+    struct dm_target* ti;
     sector_t start;
 
     struct dm_security_super_block* sb;
@@ -187,7 +188,12 @@ struct security_config {
      */
     struct security_cpu __percpu* cpu;
 
-    struct crypto_aead* tfm;
+    struct crypto_aead* tfm;       /* AEAD used for data blocks */
+    struct crypto_shash* hmac_tfm; /* HMAC used for super block and journal */
+    struct shash_desc* hmac_desc;  /* HMAC shash object */
+
+    uint8_t* hmac_digest;      /* HMAC digest */
+    uint32_t hmac_digest_size; /* HMAC hash digest size */
 
     /*
      * Layout of each crypto request:
@@ -302,6 +308,14 @@ static struct aead_request* req_of_dmreq(struct security_config* sc,
 static u8* iv_of_dmreq(struct security_config* sc,
                        struct dm_security_request* dmreq) {
     return (u8*)(dmreq + 1);
+}
+
+/*
+ * Translate input sector number to the sector number on the target device.
+ */
+static sector_t security_map_sector(struct security_config* sc,
+                                    sector_t bi_sector) {
+    return sc->data_start + dm_target_offset(sc->ti, bi_sector);
 }
 
 /*
@@ -642,7 +656,8 @@ static void security_dec_pending(struct dm_security_io* io) {
 static void sb_bio_endio(struct bio* sb_bio, int error) {
     struct dm_super_block_io* io = sb_bio->bi_private;
     struct security_config* sc = io->sc;
-    struct bio_vec* bv;
+    struct dm_security_super_block* sb = sc->sb;
+    int err;
     unsigned rw = bio_data_dir(sb_bio);
 
     if (unlikely(!bio_flagged(sb_bio, BIO_UPTODATE) && !error))
@@ -655,10 +670,13 @@ static void sb_bio_endio(struct bio* sb_bio, int error) {
     bio_put(sb_bio);
 
     if (rw == READ && !error) {
-        bv = bio_iovec_idx(sb_bio, 0);
-        BUG_ON(!bv->bv_page);
-        memcpy(sc->sb, page_address(bv->bv_page),
-               sizeof(struct dm_security_super_block));
+        err = crypto_shash_digest(
+            sc->hmac_desc, (const u8*)&sb->journal_area_size,
+            sizeof(sb->journal_area_size) + sizeof(sb->hash_area_size) +
+                sizeof(sb->data_block_size),
+            sc->hmac_digest);
+        if (err)
+            DMWARN("Failed to calculate super block mac");
     }
 
     if (unlikely(error))
@@ -738,16 +756,31 @@ bad:
 
 static int super_block_io_write(struct dm_super_block_io* io) {
     struct security_config* sc = io->sc;
+    struct dm_security_super_block* sb = sc->sb;
     struct bio* sb_bio = io->base_bio;
     int ret;
 
-    if (!virt_addr_valid(sc->sb)) {
+    if (!virt_addr_valid(sb)) {
         ret = -EINVAL;
         goto bad;
     }
-    if (!bio_add_page(sb_bio, virt_to_page(sc->sb), (1 << SECTOR_SHIFT),
-                      virt_to_phys(sc->sb) & (PAGE_SIZE - 1))) {
+    if (!bio_add_page(sb_bio, virt_to_page(sb), (1 << SECTOR_SHIFT),
+                      virt_to_phys(sb) & (PAGE_SIZE - 1))) {
         ret = -EINVAL;
+        goto bad;
+    }
+
+    /* Calculate super block mac :
+     * | JA Size | HA Size | DB Size |
+     * |   8B    |   8B    |   8B    |
+     */
+    ret = crypto_shash_digest(sc->hmac_desc, (const u8*)&sb->journal_area_size,
+                              sizeof(sb->journal_area_size) +
+                                  sizeof(sb->hash_area_size) +
+                                  sizeof(sb->data_block_size),
+                              sb->sb_mac);
+    if (ret) {
+        DMERR("Failed to calculate super block mac");
         goto bad;
     }
 
@@ -1096,17 +1129,25 @@ static void security_copy_authenckey(char* p,
 }
 
 static int security_setkey_allcpus(struct security_config* sc) {
-    int err = 0, r;
+    int ret;
+
+    ret = crypto_shash_setkey(sc->hmac_tfm,
+                              sc->key + (sc->key_size - sc->key_mac_size),
+                              sc->key_mac_size);
+    if (ret < 0)
+        goto bad;
 
     security_copy_authenckey(sc->authenc_key, sc->key,
                              sc->key_size - sc->key_mac_size, sc->key_mac_size);
-    r = crypto_aead_setkey(sc->tfm, sc->authenc_key,
-                           security_authenckey_size(sc));
-    if (r)
-        err = r;
-    memzero_explicit(sc->authenc_key, security_authenckey_size(sc));
+    ret = crypto_aead_setkey(sc->tfm, sc->authenc_key,
+                             security_authenckey_size(sc));
+    if (ret)
+        goto bad;
 
-    return err;
+    ret = 0;
+bad:
+    memzero_explicit(sc->authenc_key, security_authenckey_size(sc));
+    return ret;
 }
 
 static int security_set_key(struct security_config* sc, char* key) {
@@ -1186,6 +1227,12 @@ static void security_dtr(struct dm_target* ti) {
         free_percpu(sc->cpu);
 
     kzfree(sc->cipher_string);
+    kfree(sc->hmac_digest);
+    kfree(sc->hmac_desc);
+
+    if (sc->hmac_tfm) {
+        crypto_free_shash(sc->hmac_tfm);
+    }
 
     /* Must zero key material before freeing */
     kzfree(sc);
@@ -1211,6 +1258,42 @@ static int security_ctr_auth_cipher(struct security_config* sc, char* mac_alg) {
         return -ENOMEM;
 
     return 0;
+}
+
+static int security_ctr_mac_cipher(struct security_config* sc, char* mac_alg) {
+    struct dm_target* ti = sc->ti;
+    int ret;
+
+    sc->hmac_tfm = crypto_alloc_shash(mac_alg, 0, 0);
+    if (IS_ERR(sc->hmac_tfm)) {
+        ti->error = "Cannot initialize hash function";
+        ret = PTR_ERR(sc->hmac_tfm);
+        sc->hmac_tfm = NULL;
+        goto bad;
+    }
+    sc->hmac_digest_size = crypto_shash_digestsize(sc->hmac_tfm);
+
+    ret = -ENOMEM;
+    sc->hmac_desc =
+        kzalloc(sizeof(struct shash_desc) + crypto_shash_descsize(sc->hmac_tfm),
+                GFP_KERNEL);
+    if (!sc->hmac_desc) {
+        ti->error = "Cannot allocate HMAC Desc structure";
+        goto bad;
+    }
+
+    sc->hmac_digest = kzalloc(sc->hmac_digest_size, GFP_KERNEL);
+    if (!sc->hmac_digest) {
+        ti->error = "Cannot allocate mintegrity structure";
+        goto bad;
+    }
+
+    sc->hmac_desc->tfm = sc->hmac_tfm;
+    sc->hmac_desc->flags = CRYPTO_TFM_REQ_MAY_SLEEP;
+
+    ret = 0;
+bad:
+    return ret;
 }
 
 static int security_ctr_cipher(struct dm_target* ti, char* key) {
@@ -1241,6 +1324,13 @@ static int security_ctr_cipher(struct dm_target* ti, char* key) {
     ret = security_ctr_auth_cipher(sc, HMAC);
     if (ret < 0) {
         ti->error = "Invalid AEAD cipher spec";
+        return -ENOMEM;
+    }
+
+    /* Alloc HMAC used for super block and journal verification */
+    ret = security_ctr_mac_cipher(sc, HMAC);
+    if (ret < 0) {
+        ti->error = "Invalid HMAC cipher spec";
         return -ENOMEM;
     }
 
@@ -1349,6 +1439,27 @@ static int security_ctr_layout(struct dm_target* ti,
     if (sc->sb->magic == DM_SUPER_BLOCK_MAGIC) {
         /* Super block is valid */
         DMINFO("Super block loaded from device sector %lu", sc->sb_start);
+
+        // Check super block hmac first
+        if (memcmp(sc->hmac_digest, sc->sb->sb_mac, AUTHSIZE)) {
+            DMERR("Super block courrupted, mac not match");
+            DMINFO(
+                "  Expect MAC : %.2x %.2x %.2x %.2x %.2x %.2x %.2x "
+                "%.2x",
+                sc->sb->sb_mac[0], sc->sb->sb_mac[1], sc->sb->sb_mac[2],
+                sc->sb->sb_mac[3], sc->sb->sb_mac[4], sc->sb->sb_mac[5],
+                sc->sb->sb_mac[6], sc->sb->sb_mac[7]);
+            DMINFO(
+                "  Actual MAC : %.2x %.2x %.2x %.2x %.2x %.2x %.2x "
+                "%.2x",
+                sc->hmac_digest[0], sc->hmac_digest[1], sc->hmac_digest[2],
+                sc->hmac_digest[3], sc->hmac_digest[4], sc->hmac_digest[5],
+                sc->hmac_digest[6], sc->hmac_digest[7]);
+            ti->error = "Super block courrupted";
+            goto sb_invalid;
+        }
+
+        // Calculate device layout params from disk super block
         sc->data_block_bits = SECTOR_SHIFT + ffs(sc->sb->data_block_size) - 1;
         sc->hash_block_bits = ffs(hash_block_size) - 1;
         sc->journal_block_bits = ffs(journal_block_size) - 1;
@@ -1457,6 +1568,7 @@ bad:
     DMINFO("Hash Per Block: %u", sc->hash_per_block_bits);
     DMINFO("Leaves Per Node: %u", sc->leave_per_node_bits);
 
+sb_invalid:
     return ret;
 }
 
@@ -1484,6 +1596,8 @@ static int security_ctr(struct dm_target* ti, unsigned int argc, char** argv) {
     sc->key_size = key_size;
 
     ti->private = sc;
+    sc->ti = ti;
+
     ret = security_ctr_cipher(ti, argv[0]);
     if (ret < 0)
         goto bad;
@@ -1569,8 +1683,7 @@ static int security_map(struct dm_target* ti, struct bio* bio) {
     if (unlikely(bio->bi_rw & (REQ_FLUSH | REQ_DISCARD))) {
         bio->bi_bdev = sc->dev->bdev;
         if (bio_sectors(bio))
-            bio->bi_sector =
-                sc->data_start + dm_target_offset(ti, bio->bi_sector);
+            bio->bi_sector = security_map_sector(sc, bio->bi_sector);
         return DM_MAPIO_REMAPPED;
     }
 
@@ -1682,7 +1795,7 @@ static int security_merge(struct dm_target* ti,
         return max_size;
 
     bvm->bi_bdev = sc->dev->bdev;
-    bvm->bi_sector = sc->data_start + dm_target_offset(ti, bvm->bi_sector);
+    bvm->bi_sector = security_map_sector(sc, bvm->bi_sector);
 
     return min(max_size, q->merge_bvec_fn(q, bvm, biovec));
 }
