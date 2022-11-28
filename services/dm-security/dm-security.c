@@ -6,7 +6,6 @@
  *
  * This file is released under the GPL.
  */
-
 #include <asm/page.h>
 #include <asm/unaligned.h>
 #include <crypto/aead.h>
@@ -43,6 +42,30 @@
 #define AUTHCIPHER "gauthenc(" HMAC "," CIPHERMODE ")"
 #define AUTHSIZE 64
 
+#define DM_SUPER_BLOCK_MAGIC (cpu_to_be64(0x5345435552495459ULL))  // "SECURITY"
+#define DEFAULT_DM_SUPER_BLOCK_SIZE (512)                          // 512 bytes
+#define DEFAULT_DM_DATA_BLOCK_SIZE (4096)                          // 4KB
+#define DEFAULT_DM_HASH_BLOCK_SIZE (512)                           // 512 bytes
+#define DEFAULT_DM_JOURNAL_BLOCK_SIZE (512)                        // 512 bytes
+#define DEFAULT_DM_METADATA_RATIO (64)                             // 64:1
+#define DEFAULT_DM_METADATA_RATIO_SHIFT \
+    (ffs(DEFAULT_DM_METADATA_RATIO) - 1)  // 2^6
+#define DEFAULT_LEAVES_PER_NODE (256)
+
+/**
+ *
+ */
+struct dm_security_super_block {
+    u64 magic;                       /* super block identifier - SECURITY */
+    u8 root_digest[AUTHSIZE];        /* digest of the root block */
+    u8 root_digest_backup[AUTHSIZE]; /* backup digest of the root block */
+    u64 journal_area_size;           /* size of the journal area in sectors */
+    u64 hash_area_size;              /* size of the hash area in sectors */
+    u64 data_block_size;             /* size of the data block in sectors */
+    u8 sb_mac[AUTHSIZE];             /* hmac of super block */
+    u8 padding[0];
+};
+
 /*
  * context holding the current state of a multi-part conversion
  */
@@ -54,15 +77,28 @@ struct convert_context {
     unsigned int offset_out;
     unsigned int idx_in;
     unsigned int idx_out;
-    sector_t cc_sector;
-    atomic_t cc_pending;
+    sector_t sc_sector;
+    atomic_t sc_pending;
+};
+
+/*
+ * per super block bio private data
+ */
+struct dm_super_block_io {
+    struct security_config* sc;
+    struct bio* base_bio;
+
+    atomic_t io_pending;
+    int error;
+    struct completion restart;
+    struct dm_super_block_io* base_io;
 };
 
 /*
  * per bio private data
  */
 struct dm_security_io {
-    struct security_config* cc;
+    struct security_config* sc;
     struct bio* base_bio;
     struct work_struct work;
 
@@ -85,7 +121,7 @@ struct dm_security_request {
 struct security_config;
 
 struct security_iv_operations {
-    int (*generator)(struct security_config* cc,
+    int (*generator)(struct security_config* sc,
                      u8* iv,
                      struct dm_security_request* dmreq);
 };
@@ -110,6 +146,23 @@ struct security_cpu {
 struct security_config {
     struct dm_dev* dev;
     sector_t start;
+
+    struct dm_security_super_block* sb;
+    sector_t sb_start;                /* super block start in 512-byte sector */
+    sector_t data_start;              /* data offset in 512-byte sectors */
+    sector_t hash_start;              /* hash offert in 512-byte sectors */
+    sector_t journal_start;           /* journal offert in 512-byte sectors */
+    sector_t data_blocks;             /* the number of data blocks */
+    sector_t hash_blocks;             /* the number of hash blocks */
+    sector_t journal_blocks;          /* the number of journal blocks */
+    unsigned char data_block_bits;    /* log2(data blocksize) */
+    unsigned char hash_block_bits;    /* log2(hash blocksize) */
+    unsigned char journal_block_bits; /* log2(journal blocksize) */
+    unsigned char hash_per_block_bits; /* log2(hashes in hash block) */
+    unsigned char leave_per_node_bits; /* log2(leaves per mediate node) */
+    unsigned char levels;              /* the number of tree levels */
+
+    mempool_t* super_block_io_pool;
 
     /*
      * pool for per bio private data, crypto requests and
@@ -141,13 +194,12 @@ struct security_config {
      *
      *   struct aead_request
      *      context
-     *      padding
+     *      (no padding)
      *   struct dm_security_request
-     *      padding
+     *      (no padding)
      *   IV
      *
-     * The padding is added so that dm_security_request and the IV are
-     * correctly aligned.
+     * The padding is removed for convenient test.
      */
     unsigned int dmreq_start;
 
@@ -163,13 +215,15 @@ struct security_config {
 #define MIN_POOL_PAGES 32
 
 static struct kmem_cache* _security_io_pool;
+static struct kmem_cache* _super_block_io_pool;
 
 static void clone_init(struct dm_security_io*, struct bio*);
 static void ksecurityd_queue_security(struct dm_security_io* io);
-static u8* iv_of_dmreq(struct security_config* cc, struct dm_security_request* dmreq);
+static u8* iv_of_dmreq(struct security_config* sc,
+                       struct dm_security_request* dmreq);
 
-static struct security_cpu* this_security_config(struct security_config* cc) {
-    return this_cpu_ptr(cc->cpu);
+static struct security_cpu* this_security_config(struct security_config* sc) {
+    return this_cpu_ptr(sc->cpu);
 }
 
 /*
@@ -185,67 +239,67 @@ static struct security_cpu* this_security_config(struct security_config* cc) {
  *       obsolete loop_fish2 devices.  Do not use for new devices.
  */
 
-static int security_iv_plain_gen(struct security_config* cc,
-                              u8* iv,
-                              struct dm_security_request* dmreq) {
-    memset(iv, 0, cc->iv_size);
+static int security_iv_plain_gen(struct security_config* sc,
+                                 u8* iv,
+                                 struct dm_security_request* dmreq) {
+    memset(iv, 0, sc->iv_size);
     *(__le32*)iv = cpu_to_le32(dmreq->iv_sector & 0xffffffff);
 
     return 0;
 }
 
-static int security_iv_plain64_gen(struct security_config* cc,
-                                u8* iv,
-                                struct dm_security_request* dmreq) {
-    memset(iv, 0, cc->iv_size);
+static int security_iv_plain64_gen(struct security_config* sc,
+                                   u8* iv,
+                                   struct dm_security_request* dmreq) {
+    memset(iv, 0, sc->iv_size);
     *(__le64*)iv = cpu_to_le64(dmreq->iv_sector);
 
     return 0;
 }
 
-static int security_iv_null_gen(struct security_config* cc,
-                             u8* iv,
-                             struct dm_security_request* dmreq) {
-    memset(iv, 0, cc->iv_size);
+static int security_iv_null_gen(struct security_config* sc,
+                                u8* iv,
+                                struct dm_security_request* dmreq) {
+    memset(iv, 0, sc->iv_size);
 
     return 0;
 }
 
-static struct security_iv_operations security_iv_plain_ops = {.generator =
-                                                            security_iv_plain_gen};
+static struct security_iv_operations security_iv_plain_ops = {
+    .generator = security_iv_plain_gen};
 
 static struct security_iv_operations security_iv_plain64_ops = {
     .generator = security_iv_plain64_gen};
 
-static struct security_iv_operations security_iv_null_ops = {.generator =
-                                                           security_iv_null_gen};
+static struct security_iv_operations security_iv_null_ops = {
+    .generator = security_iv_null_gen};
 
-static void security_convert_init(struct security_config* cc,
-                               struct convert_context* ctx,
-                               struct bio* bio_out,
-                               struct bio* bio_in,
-                               sector_t sector) {
+static void security_convert_init(struct security_config* sc,
+                                  struct convert_context* ctx,
+                                  struct bio* bio_out,
+                                  struct bio* bio_in,
+                                  sector_t sector) {
     ctx->bio_in = bio_in;
     ctx->bio_out = bio_out;
     ctx->offset_in = 0;
     ctx->offset_out = 0;
     ctx->idx_in = bio_in ? bio_in->bi_idx : 0;
     ctx->idx_out = bio_out ? bio_out->bi_idx : 0;
-    ctx->cc_sector = sector;
+    ctx->sc_sector = sector;
     init_completion(&ctx->restart);
 }
 
-static struct dm_security_request* dmreq_of_req(struct security_config* cc,
-                                             void* req) {
-    return (struct dm_security_request*)((char*)req + cc->dmreq_start);
+static struct dm_security_request* dmreq_of_req(struct security_config* sc,
+                                                void* req) {
+    return (struct dm_security_request*)((char*)req + sc->dmreq_start);
 }
 
-static struct aead_request* req_of_dmreq(struct security_config* cc,
+static struct aead_request* req_of_dmreq(struct security_config* sc,
                                          struct dm_security_request* dmreq) {
-    return (struct aead_request*)((char*)dmreq - cc->dmreq_start);
+    return (struct aead_request*)((char*)dmreq - sc->dmreq_start);
 }
 
-static u8* iv_of_dmreq(struct security_config* cc,
+static u8* iv_of_dmreq(struct security_config* sc,
                        struct dm_security_request* dmreq) {
     return (u8*)(dmreq + 1);
 }
@@ -253,9 +307,9 @@ static u8* iv_of_dmreq(struct security_config* cc,
 /*
  * For KGPU: convert all blocks together for speedup
  */
-static int security_convert_blocks(struct security_config* cc,
-                                struct convert_context* ctx,
-                                struct ablkcipher_request* req) {
+static int security_convert_blocks(struct security_config* sc,
+                                   struct convert_context* ctx,
+                                   struct ablkcipher_request* req) {
     struct scatterlist *sgin, *sgout;
     struct bio_vec* bv_in;
     struct bio_vec* bv_out;
@@ -264,19 +318,20 @@ static int security_convert_blocks(struct security_config* cc,
     int r = 0;
     unsigned int sz = 0;
 
-    dmreq = dmreq_of_req(cc, req);
-    iv = iv_of_dmreq(cc, dmreq);
+    dmreq = dmreq_of_req(sc, req);
+    iv = iv_of_dmreq(sc, dmreq);
 
     // Use the sector number as the IV,
     // it might be wrong when encrypting multiple blocks in a batch.
-    dmreq->iv_sector = ctx->cc_sector;
+    dmreq->iv_sector = ctx->sc_sector;
     dmreq->ctx = ctx;
 
     sgin = kmalloc((ctx->bio_in->bi_vcnt + ctx->bio_out->bi_vcnt) *
                        sizeof(struct scatterlist),
                    GFP_KERNEL);
     if (!sgin) {
-        printk("[dm-security] Error: out of memory %s:%d\n", __FILE__, __LINE__);
+        printk("[dm-security] Error: out of memory %s:%d\n", __FILE__,
+               __LINE__);
         return -ENOMEM;
     }
     sgout = sgin + ctx->bio_in->bi_vcnt;
@@ -299,8 +354,8 @@ static int security_convert_blocks(struct security_config* cc,
         sz += bv_in->bv_len;
     }
 
-    if (cc->iv_gen_ops) {
-        r = cc->iv_gen_ops->generator(cc, iv, dmreq);
+    if (sc->iv_gen_ops) {
+        r = sc->iv_gen_ops->generator(sc, iv, dmreq);
         if (r < 0)
             return r;
     }
@@ -317,9 +372,9 @@ static int security_convert_blocks(struct security_config* cc,
     return r;
 }
 
-static int security_convert_block(struct security_config* cc,
-                               struct convert_context* ctx,
-                               struct aead_request* req) {
+static int security_convert_block(struct security_config* sc,
+                                  struct convert_context* ctx,
+                                  struct aead_request* req) {
     struct bio_vec* bv_in = bio_iovec_idx(ctx->bio_in, ctx->idx_in);
     struct bio_vec* bv_out = bio_iovec_idx(ctx->bio_out, ctx->idx_out);
     struct dm_security_request* dmreq;
@@ -329,10 +384,10 @@ static int security_convert_block(struct security_config* cc,
     unsigned int assoclen = sizeof(uint64_t);
     int r;
 
-    dmreq = dmreq_of_req(cc, req);
-    iv = iv_of_dmreq(cc, dmreq);
+    dmreq = dmreq_of_req(sc, req);
+    iv = iv_of_dmreq(sc, dmreq);
 
-    dmreq->iv_sector = ctx->cc_sector;
+    dmreq->iv_sector = ctx->sc_sector;
     dmreq->ctx = ctx;
 
     assoc = (uint64_t*)kzalloc(assoclen, GFP_KERNEL);
@@ -367,8 +422,8 @@ static int security_convert_block(struct security_config* cc,
         ctx->idx_out++;
     }
 
-    if (cc->iv_gen_ops) {
-        r = cc->iv_gen_ops->generator(cc, iv, dmreq);
+    if (sc->iv_gen_ops) {
+        r = sc->iv_gen_ops->generator(sc, iv, dmreq);
         if (r < 0)
             return r;
     }
@@ -386,44 +441,45 @@ static int security_convert_block(struct security_config* cc,
 
     if (r == -EBADMSG)
         DMERR_LIMIT("INTEGRITY AEAD ERROR, sector %llu",
-                    (unsigned long long)le64_to_cpu(ctx->cc_sector));
+                    (unsigned long long)le64_to_cpu(ctx->sc_sector));
 
     return r;
 }
 
 static void ksecurityd_async_done(struct crypto_async_request* async_req,
-                               int error);
+                                  int error);
 
-static void crypt_alloc_req(struct security_config* cc,
+static void crypt_alloc_req(struct security_config* sc,
                             struct convert_context* ctx) {
-    struct security_cpu* this_cc = this_security_config(cc);
+    struct security_cpu* this_sc = this_security_config(sc);
 
-    if (!this_cc->req)
-        this_cc->req = mempool_alloc(cc->req_pool, GFP_NOIO);
+    if (!this_sc->req)
+        this_sc->req = mempool_alloc(sc->req_pool, GFP_NOIO);
 
-    aead_request_set_tfm(this_cc->req, cc->tfm);
+    aead_request_set_tfm(this_sc->req, sc->tfm);
     aead_request_set_callback(
-        this_cc->req, CRYPTO_TFM_REQ_MAY_BACKLOG | CRYPTO_TFM_REQ_MAY_SLEEP,
-        ksecurityd_async_done, dmreq_of_req(cc, this_cc->req));
+        this_sc->req, CRYPTO_TFM_REQ_MAY_BACKLOG | CRYPTO_TFM_REQ_MAY_SLEEP,
+        ksecurityd_async_done, dmreq_of_req(sc, this_sc->req));
 }
 
 /*
  * Encrypt / decrypt data from one bio to another one (can be the same one)
  */
-static int security_convert(struct security_config* cc, struct convert_context* ctx) {
-    struct security_cpu* this_cc = this_security_config(cc);
+static int security_convert(struct security_config* sc,
+                            struct convert_context* ctx) {
+    struct security_cpu* this_sc = this_security_config(sc);
     int r;
 
-    atomic_set(&ctx->cc_pending, 1);
+    atomic_set(&ctx->sc_pending, 1);
 
     while (ctx->idx_in < ctx->bio_in->bi_vcnt &&
            ctx->idx_out < ctx->bio_out->bi_vcnt) {
-        crypt_alloc_req(cc, ctx);
+        crypt_alloc_req(sc, ctx);
 
-        atomic_inc(&ctx->cc_pending);
+        atomic_inc(&ctx->sc_pending);
 
-        // r = security_convert_blocks(cc, ctx, this_cc->req);
-        r = security_convert_block(cc, ctx, this_cc->req);
+        // r = security_convert_blocks(sc, ctx, this_sc->req);
+        r = security_convert_block(sc, ctx, this_sc->req);
 
         switch (r) {
             /* async */
@@ -440,8 +496,8 @@ static int security_convert(struct security_config* cc, struct convert_context* 
              * completion function ksecurityd_async_done() will be called.
              */
             case -EINPROGRESS:
-                this_cc->req = NULL;
-                ctx->cc_sector++;
+                this_sc->req = NULL;
+                ctx->sc_sector++;
                 continue;
 
             /* sync */
@@ -449,8 +505,8 @@ static int security_convert(struct security_config* cc, struct convert_context* 
              * The request was already processed (synchronously).
              */
             case 0:
-                atomic_dec(&ctx->cc_pending);
-                ctx->cc_sector++;
+                atomic_dec(&ctx->sc_pending);
+                ctx->sc_sector++;
                 cond_resched();
                 continue;
 
@@ -458,12 +514,12 @@ static int security_convert(struct security_config* cc, struct convert_context* 
              * There was a data integrity error.
              */
             case -EBADMSG:
-                atomic_dec(&ctx->cc_pending);
+                atomic_dec(&ctx->sc_pending);
                 return -EILSEQ;
 
             /* error */
             default:
-                atomic_dec(&ctx->cc_pending);
+                atomic_dec(&ctx->sc_pending);
                 return r;
         }
     }
@@ -478,16 +534,16 @@ static int security_convert(struct security_config* cc, struct convert_context* 
  * *out_of_pages set to 1.
  */
 static struct bio* security_alloc_buffer(struct dm_security_io* io,
-                                      unsigned size,
-                                      unsigned* out_of_pages) {
-    struct security_config* cc = io->cc;
+                                         unsigned size,
+                                         unsigned* out_of_pages) {
+    struct security_config* sc = io->sc;
     struct bio* clone;
     unsigned int nr_iovecs = (size + PAGE_SIZE - 1) >> PAGE_SHIFT;
     gfp_t gfp_mask = GFP_NOIO | __GFP_HIGHMEM;
     unsigned i, len;
     struct page* page;
 
-    clone = bio_alloc_bioset(GFP_NOIO, nr_iovecs, cc->bs);
+    clone = bio_alloc_bioset(GFP_NOIO, nr_iovecs, sc->bs);
     if (!clone)
         return NULL;
 
@@ -495,7 +551,7 @@ static struct bio* security_alloc_buffer(struct dm_security_io* io,
     *out_of_pages = 0;
 
     for (i = 0; i < nr_iovecs; i++) {
-        page = mempool_alloc(cc->page_pool, gfp_mask);
+        page = mempool_alloc(sc->page_pool, gfp_mask);
         if (!page) {
             *out_of_pages = 1;
             break;
@@ -511,7 +567,7 @@ static struct bio* security_alloc_buffer(struct dm_security_io* io,
         len = (size > PAGE_SIZE) ? PAGE_SIZE : size;
 
         if (!bio_add_page(clone, page, len, 0)) {
-            mempool_free(page, cc->page_pool);
+            mempool_free(page, sc->page_pool);
             break;
         }
 
@@ -526,25 +582,25 @@ static struct bio* security_alloc_buffer(struct dm_security_io* io,
     return clone;
 }
 
-static void security_free_buffer_pages(struct security_config* cc,
-                                    struct bio* clone) {
+static void security_free_buffer_pages(struct security_config* sc,
+                                       struct bio* clone) {
     unsigned int i;
     struct bio_vec* bv;
 
     bio_for_each_segment_all(bv, clone, i) {
         BUG_ON(!bv->bv_page);
-        mempool_free(bv->bv_page, cc->page_pool);
+        mempool_free(bv->bv_page, sc->page_pool);
         bv->bv_page = NULL;
     }
 }
 
-static struct dm_security_io* security_io_alloc(struct security_config* cc,
-                                          struct bio* bio,
-                                          sector_t sector) {
+static struct dm_security_io* security_io_alloc(struct security_config* sc,
+                                                struct bio* bio,
+                                                sector_t sector) {
     struct dm_security_io* io;
 
-    io = mempool_alloc(cc->io_pool, GFP_NOIO);
-    io->cc = cc;
+    io = mempool_alloc(sc->io_pool, GFP_NOIO);
+    io->sc = sc;
     io->base_bio = bio;
     io->sector = sector;
     io->error = 0;
@@ -564,7 +620,7 @@ static void security_inc_pending(struct dm_security_io* io) {
  * If base_io is set, wait for the last fragment to complete.
  */
 static void security_dec_pending(struct dm_security_io* io) {
-    struct security_config* cc = io->cc;
+    struct security_config* sc = io->sc;
     struct bio* base_bio = io->base_bio;
     struct dm_security_io* base_io = io->base_io;
     int error = io->error;
@@ -572,7 +628,7 @@ static void security_dec_pending(struct dm_security_io* io) {
     if (!atomic_dec_and_test(&io->io_pending))
         return;
 
-    mempool_free(io, cc->io_pool);
+    mempool_free(io, sc->io_pool);
 
     if (likely(!base_io))
         bio_endio(base_bio, error);
@@ -581,6 +637,129 @@ static void security_dec_pending(struct dm_security_io* io) {
             base_io->error = error;
         security_dec_pending(base_io);
     }
+}
+
+static void sb_bio_endio(struct bio* sb_bio, int error) {
+    struct dm_super_block_io* io = sb_bio->bi_private;
+    struct security_config* sc = io->sc;
+    struct bio_vec* bv;
+    unsigned rw = bio_data_dir(sb_bio);
+
+    if (unlikely(!bio_flagged(sb_bio, BIO_UPTODATE) && !error))
+        error = -EIO;
+
+    if (rw == WRITE) {
+        // do nothing now
+    }
+
+    bio_put(sb_bio);
+
+    if (rw == READ && !error) {
+        bv = bio_iovec_idx(sb_bio, 0);
+        BUG_ON(!bv->bv_page);
+        memcpy(sc->sb, page_address(bv->bv_page),
+               sizeof(struct dm_security_super_block));
+    }
+
+    if (unlikely(error))
+        io->error = error;
+    complete(&io->restart);
+
+    if (!atomic_dec_and_test(&io->io_pending))
+        return;
+    mempool_free(io, sc->super_block_io_pool);
+}
+
+static void sb_bio_init(struct dm_super_block_io* io, struct bio* sb_bio) {
+    struct security_config* sc = io->sc;
+
+    sb_bio->bi_private = io;
+    sb_bio->bi_end_io = sb_bio_endio;
+    sb_bio->bi_bdev = sc->dev->bdev;
+    sb_bio->bi_sector = sc->sb_start;
+}
+
+static struct dm_super_block_io* super_block_io_alloc(
+    struct security_config* sc) {
+    struct dm_super_block_io* sb_io;
+    struct bio* sb_bio;
+    unsigned int nr_iovecs =
+        (DEFAULT_DM_SUPER_BLOCK_SIZE + PAGE_SIZE - 1) >> PAGE_SHIFT;
+
+    sb_bio = bio_alloc_bioset(GFP_NOIO, nr_iovecs, sc->bs);
+    if (!sb_bio)
+        return NULL;
+
+    sb_io = mempool_alloc(sc->super_block_io_pool, GFP_NOIO);
+    sb_io->sc = sc;
+    sb_io->base_bio = sb_bio;
+    sb_io->error = 0;
+    sb_io->base_io = NULL;
+
+    sb_bio_init(sb_io, sb_bio);
+
+    atomic_set(&sb_io->io_pending, 0);
+
+    return sb_io;
+}
+
+static void super_block_io_free(struct dm_super_block_io* sb_io) {
+    if (!sb_io)
+        return;
+    if (sb_io->base_bio)
+        bio_put(sb_io->base_bio);
+    mempool_free(sb_io, sb_io->sc->super_block_io_pool);
+}
+
+static int super_block_io_read(struct dm_super_block_io* io) {
+    struct security_config* sc = io->sc;
+    struct bio* sb_bio = io->base_bio;
+    int ret = 0;
+
+    if (!virt_addr_valid(sc->sb)) {
+        ret = -EINVAL;
+        goto bad;
+    }
+    if (!bio_add_page(sb_bio, virt_to_page(sc->sb), (1 << SECTOR_SHIFT),
+                      virt_to_phys(sc->sb) & (PAGE_SIZE - 1))) {
+        ret = -EINVAL;
+        goto bad;
+    }
+
+    atomic_inc(&io->io_pending);
+
+    sb_bio->bi_rw |= READ;
+    init_completion(&io->restart);
+    generic_make_request(sb_bio);
+    ret = 0;
+bad:
+    return ret;
+}
+
+static int super_block_io_write(struct dm_super_block_io* io) {
+    struct security_config* sc = io->sc;
+    struct bio* sb_bio = io->base_bio;
+    int ret;
+
+    if (!virt_addr_valid(sc->sb)) {
+        ret = -EINVAL;
+        goto bad;
+    }
+    if (!bio_add_page(sb_bio, virt_to_page(sc->sb), (1 << SECTOR_SHIFT),
+                      virt_to_phys(sc->sb) & (PAGE_SIZE - 1))) {
+        ret = -EINVAL;
+        goto bad;
+    }
+
+    atomic_inc(&io->io_pending);
+
+    sb_bio->bi_rw |= WRITE;
+    init_completion(&io->restart);
+    generic_make_request(sb_bio);
+
+    ret = 0;
+bad:
+    return ret;
 }
 
 /*
@@ -602,7 +781,7 @@ static void security_dec_pending(struct dm_security_io* io) {
  */
 static void security_endio(struct bio* clone, int error) {
     struct dm_security_io* io = clone->bi_private;
-    struct security_config* cc = io->cc;
+    struct security_config* sc = io->sc;
     unsigned rw = bio_data_dir(clone);
 
     if (unlikely(!bio_flagged(clone, BIO_UPTODATE) && !error))
@@ -612,7 +791,7 @@ static void security_endio(struct bio* clone, int error) {
      * free the processed pages
      */
     if (rw == WRITE)
-        security_free_buffer_pages(cc, clone);
+        security_free_buffer_pages(sc, clone);
 
     bio_put(clone);
 
@@ -628,16 +807,16 @@ static void security_endio(struct bio* clone, int error) {
 }
 
 static void clone_init(struct dm_security_io* io, struct bio* clone) {
-    struct security_config* cc = io->cc;
+    struct security_config* sc = io->sc;
 
     clone->bi_private = io;
     clone->bi_end_io = security_endio;
-    clone->bi_bdev = cc->dev->bdev;
+    clone->bi_bdev = sc->dev->bdev;
     clone->bi_rw = io->base_bio->bi_rw;
 }
 
 static int ksecurityd_io_read(struct dm_security_io* io, gfp_t gfp) {
-    struct security_config* cc = io->cc;
+    struct security_config* sc = io->sc;
     struct bio* base_bio = io->base_bio;
     struct bio* clone;
 
@@ -646,14 +825,14 @@ static int ksecurityd_io_read(struct dm_security_io* io, gfp_t gfp) {
      * copy the required bvecs because we need the original
      * one in order to decrypt the whole bio data *afterwards*.
      */
-    clone = bio_clone_bioset(base_bio, gfp, cc->bs);
+    clone = bio_clone_bioset(base_bio, gfp, sc->bs);
     if (!clone)
         return 1;
 
     security_inc_pending(io);
 
     clone_init(io, clone);
-    clone->bi_sector = cc->start + io->sector;
+    clone->bi_sector = sc->data_start + io->sector;
 
     generic_make_request(clone);
     return 0;
@@ -677,18 +856,19 @@ static void ksecurityd_io(struct work_struct* work) {
 }
 
 static void ksecurityd_queue_io(struct dm_security_io* io) {
-    struct security_config* cc = io->cc;
+    struct security_config* sc = io->sc;
 
     INIT_WORK(&io->work, ksecurityd_io);
-    queue_work(cc->io_queue, &io->work);
+    queue_work(sc->io_queue, &io->work);
 }
 
-static void ksecurityd_security_write_io_submit(struct dm_security_io* io, int async) {
+static void ksecurityd_security_write_io_submit(struct dm_security_io* io,
+                                                int async) {
     struct bio* clone = io->ctx.bio_out;
-    struct security_config* cc = io->cc;
+    struct security_config* sc = io->sc;
 
     if (unlikely(io->error < 0)) {
-        security_free_buffer_pages(cc, clone);
+        security_free_buffer_pages(sc, clone);
         bio_put(clone);
         security_dec_pending(io);
         return;
@@ -697,7 +877,7 @@ static void ksecurityd_security_write_io_submit(struct dm_security_io* io, int a
     /* security_convert should have filled the clone bio */
     BUG_ON(io->ctx.idx_out < clone->bi_vcnt);
 
-    clone->bi_sector = cc->start + io->sector;
+    clone->bi_sector = sc->data_start + io->sector;
 
     if (async)
         ksecurityd_queue_io(io);
@@ -706,7 +886,7 @@ static void ksecurityd_security_write_io_submit(struct dm_security_io* io, int a
 }
 
 static void ksecurityd_security_write_convert(struct dm_security_io* io) {
-    struct security_config* cc = io->cc;
+    struct security_config* sc = io->sc;
     struct bio* clone;
     struct dm_security_io* new_io;
     int security_finished;
@@ -719,7 +899,7 @@ static void ksecurityd_security_write_convert(struct dm_security_io* io) {
      * Prevent io from disappearing until this function completes.
      */
     security_inc_pending(io);
-    security_convert_init(cc, &io->ctx, NULL, io->base_bio, sector);
+    security_convert_init(sc, &io->ctx, NULL, io->base_bio, sector);
 
     /*
      * The allocated buffers can be smaller than the whole bio,
@@ -740,11 +920,11 @@ static void ksecurityd_security_write_convert(struct dm_security_io* io) {
 
         security_inc_pending(io);
 
-        r = security_convert(cc, &io->ctx);
+        r = security_convert(sc, &io->ctx);
         if (r < 0)
             io->error = -EIO;
 
-        security_finished = atomic_dec_and_test(&io->ctx.cc_pending);
+        security_finished = atomic_dec_and_test(&io->ctx.sc_pending);
 
         /* Encryption was already finished, submit io now */
         if (security_finished) {
@@ -772,9 +952,9 @@ static void ksecurityd_security_write_convert(struct dm_security_io* io) {
          * between fragments, so switch to a new dm_security_io structure.
          */
         if (unlikely(!security_finished && remaining)) {
-            new_io = security_io_alloc(io->cc, io->base_bio, sector);
+            new_io = security_io_alloc(io->sc, io->base_bio, sector);
             security_inc_pending(new_io);
-            security_convert_init(cc, &new_io->ctx, NULL, io->base_bio, sector);
+            security_convert_init(sc, &new_io->ctx, NULL, io->base_bio, sector);
             new_io->ctx.idx_in = io->ctx.idx_in;
             new_io->ctx.offset_in = io->ctx.offset_in;
 
@@ -802,41 +982,41 @@ static void ksecurityd_security_read_done(struct dm_security_io* io) {
 }
 
 static void ksecurityd_security_read_convert(struct dm_security_io* io) {
-    struct security_config* cc = io->cc;
+    struct security_config* sc = io->sc;
     int r = 0;
 
     security_inc_pending(io);
 
-    security_convert_init(cc, &io->ctx, io->base_bio, io->base_bio, io->sector);
+    security_convert_init(sc, &io->ctx, io->base_bio, io->base_bio, io->sector);
 
-    r = security_convert(cc, &io->ctx);
+    r = security_convert(sc, &io->ctx);
     if (r < 0)
         io->error = -EIO;
 
-    if (atomic_dec_and_test(&io->ctx.cc_pending))
+    if (atomic_dec_and_test(&io->ctx.sc_pending))
         ksecurityd_security_read_done(io);
 
     security_dec_pending(io);
 }
 
 static void ksecurityd_async_done(struct crypto_async_request* async_req,
-                               int error) {
+                                  int error) {
     struct dm_security_request* dmreq = async_req->data;
     struct convert_context* ctx = dmreq->ctx;
     struct dm_security_io* io = container_of(ctx, struct dm_security_io, ctx);
-    struct security_config* cc = io->cc;
+    struct security_config* sc = io->sc;
 
     if (error == -EINPROGRESS) {
         complete(&ctx->restart);
         return;
     }
 
-    // if (error < 0)
-    //     io->error = -EIO;
+    if (error < 0)
+        io->error = -EIO;
 
-    mempool_free(req_of_dmreq(cc, dmreq), cc->req_pool);
+    mempool_free(req_of_dmreq(sc, dmreq), sc->req_pool);
 
-    if (!atomic_dec_and_test(&ctx->cc_pending))
+    if (!atomic_dec_and_test(&ctx->sc_pending))
         return;
 
     if (bio_data_dir(io->base_bio) == READ)
@@ -855,52 +1035,52 @@ static void ksecurityd_security(struct work_struct* work) {
 }
 
 static void ksecurityd_queue_security(struct dm_security_io* io) {
-    struct security_config* cc = io->cc;
+    struct security_config* sc = io->sc;
 
     INIT_WORK(&io->work, ksecurityd_security);
-    queue_work(cc->security_queue, &io->work);
+    queue_work(sc->security_queue, &io->work);
 }
 
-static void security_free_tfm(struct security_config* cc) {
-    if (!cc->tfm)
+static void security_free_tfm(struct security_config* sc) {
+    if (!sc->tfm)
         return;
 
-    if (cc->tfm && !IS_ERR(cc->tfm)) {
-        crypto_free_aead(cc->tfm);
-        cc->tfm = NULL;
+    if (sc->tfm && !IS_ERR(sc->tfm)) {
+        crypto_free_aead(sc->tfm);
+        sc->tfm = NULL;
     }
 }
 
-static int security_alloc_tfm(struct security_config* cc, char* ciphermode) {
+static int security_alloc_tfm(struct security_config* sc, char* ciphermode) {
     int err;
 
-    cc->tfm = crypto_alloc_aead(ciphermode, 0, 0);
-    if (IS_ERR(cc->tfm)) {
-        err = PTR_ERR(cc->tfm);
-        security_free_tfm(cc);
+    sc->tfm = crypto_alloc_aead(ciphermode, 0, 0);
+    if (IS_ERR(sc->tfm)) {
+        err = PTR_ERR(sc->tfm);
+        security_free_tfm(sc);
         return err;
     }
 
     return 0;
 }
 
-static unsigned security_authenckey_size(struct security_config* cc) {
-    return cc->key_size + RTA_SPACE(sizeof(struct crypto_authenc_key_param));
+static unsigned security_authenckey_size(struct security_config* sc) {
+    return sc->key_size + RTA_SPACE(sizeof(struct crypto_authenc_key_param));
 }
 
 /*
  * If AEAD is composed like authenc(hmac(sha512),xts(aes)),
  * the key must be for some reason in special format.
- * This funcion converts cc->key to this special format.
+ * This funcion converts sc->key to this special format.
  *
  * | rta length | rta type | enckey length | authkey | enckey |
  *         ↑        ↑              ↑
  *      (little endian)      (big endian)
  */
 static void security_copy_authenckey(char* p,
-                                  const void* key,
-                                  unsigned enckeylen,
-                                  unsigned authkeylen) {
+                                     const void* key,
+                                     unsigned enckeylen,
+                                     unsigned authkeylen) {
     struct crypto_authenc_key_param* param;
     struct rtattr* rta;
 
@@ -915,37 +1095,38 @@ static void security_copy_authenckey(char* p,
     memcpy(p, key, enckeylen);
 }
 
-static int security_setkey_allcpus(struct security_config* cc) {
+static int security_setkey_allcpus(struct security_config* sc) {
     int err = 0, r;
 
-    security_copy_authenckey(cc->authenc_key, cc->key,
-                          cc->key_size - cc->key_mac_size, cc->key_mac_size);
-    r = crypto_aead_setkey(cc->tfm, cc->authenc_key, security_authenckey_size(cc));
+    security_copy_authenckey(sc->authenc_key, sc->key,
+                             sc->key_size - sc->key_mac_size, sc->key_mac_size);
+    r = crypto_aead_setkey(sc->tfm, sc->authenc_key,
+                           security_authenckey_size(sc));
     if (r)
         err = r;
-    memzero_explicit(cc->authenc_key, security_authenckey_size(cc));
+    memzero_explicit(sc->authenc_key, security_authenckey_size(sc));
 
     return err;
 }
 
-static int security_set_key(struct security_config* cc, char* key) {
+static int security_set_key(struct security_config* sc, char* key) {
     int r = -EINVAL;
     int key_string_len = strlen(key);
 
     /* The key size may not be changed. */
-    if (cc->key_size != (key_string_len >> 1))
+    if (sc->key_size != (key_string_len >> 1))
         goto out;
 
     /* Hyphen (which gives a key_size of zero) means there is no key. */
-    if (!cc->key_size && strcmp(key, "-"))
+    if (!sc->key_size && strcmp(key, "-"))
         goto out;
 
-    if (cc->key_size && hex2bin(cc->key, key, cc->key_size) < 0)
+    if (sc->key_size && hex2bin(sc->key, key, sc->key_size) < 0)
         goto out;
 
-    set_bit(DM_CRYPT_KEY_VALID, &cc->flags);
+    set_bit(DM_CRYPT_KEY_VALID, &sc->flags);
 
-    r = security_setkey_allcpus(cc);
+    r = security_setkey_allcpus(sc);
 
 out:
     /* Hex key string not needed after here, so wipe it. */
@@ -954,57 +1135,60 @@ out:
     return r;
 }
 
-static int security_wipe_key(struct security_config* cc) {
-    clear_bit(DM_CRYPT_KEY_VALID, &cc->flags);
-    memset(&cc->key, 0, cc->key_size * sizeof(u8));
+static int security_wipe_key(struct security_config* sc) {
+    clear_bit(DM_CRYPT_KEY_VALID, &sc->flags);
+    memset(&sc->key, 0, sc->key_size * sizeof(u8));
 
-    return security_setkey_allcpus(cc);
+    return security_setkey_allcpus(sc);
 }
 
 static void security_dtr(struct dm_target* ti) {
-    struct security_config* cc = ti->private;
-    struct security_cpu* cpu_cc;
+    struct security_config* sc = ti->private;
+    struct security_cpu* cpu_sc;
     int cpu;
 
     ti->private = NULL;
 
-    if (!cc)
+    if (!sc)
         return;
 
-    if (cc->io_queue)
-        destroy_workqueue(cc->io_queue);
-    if (cc->security_queue)
-        destroy_workqueue(cc->security_queue);
+    if (sc->io_queue)
+        destroy_workqueue(sc->io_queue);
+    if (sc->security_queue)
+        destroy_workqueue(sc->security_queue);
 
-    if (cc->cpu)
+    if (sc->cpu)
         for_each_possible_cpu(cpu) {
-            cpu_cc = per_cpu_ptr(cc->cpu, cpu);
-            if (cpu_cc->req)
-                mempool_free(cpu_cc->req, cc->req_pool);
+            cpu_sc = per_cpu_ptr(sc->cpu, cpu);
+            if (cpu_sc->req)
+                mempool_free(cpu_sc->req, sc->req_pool);
         }
 
-    security_free_tfm(cc);
+    security_free_tfm(sc);
 
-    if (cc->bs)
-        bioset_free(cc->bs);
+    if (sc->sb)
+        kfree(sc->sb);
 
-    if (cc->page_pool)
-        mempool_destroy(cc->page_pool);
-    if (cc->req_pool)
-        mempool_destroy(cc->req_pool);
-    if (cc->io_pool)
-        mempool_destroy(cc->io_pool);
+    if (sc->bs)
+        bioset_free(sc->bs);
 
-    if (cc->dev)
-        dm_put_device(ti, cc->dev);
+    if (sc->page_pool)
+        mempool_destroy(sc->page_pool);
+    if (sc->req_pool)
+        mempool_destroy(sc->req_pool);
+    if (sc->io_pool)
+        mempool_destroy(sc->io_pool);
 
-    if (cc->cpu)
-        free_percpu(cc->cpu);
+    if (sc->dev)
+        dm_put_device(ti, sc->dev);
 
-    kzfree(cc->cipher_string);
+    if (sc->cpu)
+        free_percpu(sc->cpu);
+
+    kzfree(sc->cipher_string);
 
     /* Must zero key material before freeing */
-    kzfree(cc);
+    kzfree(sc);
 }
 
 /*
@@ -1012,48 +1196,49 @@ static void security_dtr(struct dm_target* ti) {
  * The HMAC is needed to calculate tag size (HMAC digest size).
  * This should be probably done by crypto-api calls (once available...)
  */
-static int security_ctr_auth_cipher(struct security_config* cc, char* mac_alg) {
+static int security_ctr_auth_cipher(struct security_config* sc, char* mac_alg) {
     struct crypto_ahash* mac;
 
     mac = crypto_alloc_ahash(mac_alg, 0, 0);
     if (IS_ERR(mac))
         return PTR_ERR(mac);
 
-    cc->key_mac_size = crypto_ahash_digestsize(mac);
+    sc->key_mac_size = crypto_ahash_digestsize(mac);
     crypto_free_ahash(mac);
 
-    cc->authenc_key = kmalloc(security_authenckey_size(cc), GFP_KERNEL);
-    if (!cc->authenc_key)
+    sc->authenc_key = kmalloc(security_authenckey_size(sc), GFP_KERNEL);
+    if (!sc->authenc_key)
         return -ENOMEM;
 
     return 0;
 }
 
 static int security_ctr_cipher(struct dm_target* ti, char* key) {
-    struct security_config* cc = ti->private;
+    struct security_config* sc = ti->private;
     const char* ivmode = DEFAULT_IVMODE;
     int ret = -EINVAL;
 
-    cc->cipher_string = kstrdup(AUTHCIPHER, GFP_KERNEL);
-    if (!cc->cipher_string)
+    sc->cipher_string = kstrdup(AUTHCIPHER, GFP_KERNEL);
+    if (!sc->cipher_string)
         goto bad_mem;
 
-    cc->cpu = __alloc_percpu(sizeof(*(cc->cpu)), __alignof__(struct security_cpu));
-    if (!cc->cpu) {
+    sc->cpu =
+        __alloc_percpu(sizeof(*(sc->cpu)), __alignof__(struct security_cpu));
+    if (!sc->cpu) {
         ti->error = "Cannot allocate per cpu state";
         goto bad_mem;
     }
 
     /* Allocate cipher */
-    printk("Auth Cipher : %s\n", AUTHCIPHER);
-    ret = security_alloc_tfm(cc, AUTHCIPHER);
+    DMINFO("Auth Cipher : %s", AUTHCIPHER);
+    ret = security_alloc_tfm(sc, AUTHCIPHER);
     if (ret < 0) {
         ti->error = "Error allocating crypto tfm";
         goto bad;
     }
 
     /* Alloc AEAD, can be used only in new format. */
-    ret = security_ctr_auth_cipher(cc, HMAC);
+    ret = security_ctr_auth_cipher(sc, HMAC);
     if (ret < 0) {
         ti->error = "Invalid AEAD cipher spec";
         return -ENOMEM;
@@ -1061,18 +1246,18 @@ static int security_ctr_cipher(struct dm_target* ti, char* key) {
 
     /* Initialize IV */
     /* at least a 64 bit sector number should fit in our buffer */
-    cc->iv_size = max(crypto_aead_ivsize(cc->tfm),
+    sc->iv_size = max(crypto_aead_ivsize(sc->tfm),
                       (unsigned int)(sizeof(u64) / sizeof(u8)));
 
     /* Initialize and set key */
-    ret = security_set_key(cc, key);
+    ret = security_set_key(sc, key);
     if (ret < 0) {
         ti->error = "Error decoding and setting key";
         goto bad;
     }
 
     /* Set authsize */
-    ret = crypto_aead_setauthsize(cc->tfm, AUTHSIZE);
+    ret = crypto_aead_setauthsize(sc->tfm, AUTHSIZE);
     if (ret) {
         ti->error = "Error setting authsize";
         goto bad;
@@ -1080,13 +1265,13 @@ static int security_ctr_cipher(struct dm_target* ti, char* key) {
 
     /* Choose ivmode, see comments at iv code. */
     if (ivmode == NULL)
-        cc->iv_gen_ops = NULL;
+        sc->iv_gen_ops = NULL;
     else if (strcmp(ivmode, "plain") == 0)
-        cc->iv_gen_ops = &security_iv_plain_ops;
+        sc->iv_gen_ops = &security_iv_plain_ops;
     else if (strcmp(ivmode, "plain64") == 0)
-        cc->iv_gen_ops = &security_iv_plain64_ops;
+        sc->iv_gen_ops = &security_iv_plain64_ops;
     else if (strcmp(ivmode, "null") == 0)
-        cc->iv_gen_ops = &security_iv_null_ops;
+        sc->iv_gen_ops = &security_iv_null_ops;
     else {
         ret = -EINVAL;
         ti->error = "Invalid IV mode";
@@ -1102,16 +1287,187 @@ bad_mem:
     return -ENOMEM;
 }
 
+/**
+ * Disk layout:
+ * | SuperBlock | Journal Area | Hash Area | Data Blocks |
+ *
+ * Super Block (512B):
+ * | Magic | Rt.H | Bak.Rt | JA Size | HA Size | DB Size | SB HMAC | Padding |
+ * |  64B  | 64B  |  64B   |   8B    |   8B    |   8B    |   64B   | (Rest)  |
+ *
+ * Hash Area:
+ * | Mediate Nodes | Leaves Nodes |
+ */
+static int security_ctr_layout(struct dm_target* ti,
+                               char* dev_path,
+                               char* start) {
+    struct security_config* sc = ti->private;
+    struct dm_super_block_io* sb_io;
+    unsigned long long tmpll;
+    unsigned int data_block_size = DEFAULT_DM_DATA_BLOCK_SIZE;
+    unsigned int hash_block_size = DEFAULT_DM_HASH_BLOCK_SIZE;
+    unsigned int journal_block_size = DEFAULT_DM_JOURNAL_BLOCK_SIZE;
+    unsigned int leave_per_node = DEFAULT_LEAVES_PER_NODE;
+    int ret = -EINVAL;
+    char dummy;
+
+    if (dm_get_device(ti, dev_path, dm_table_get_mode(ti->table), &sc->dev)) {
+        ti->error = "Device lookup failed";
+        goto bad;
+    }
+
+    if (sscanf(start, "%llu%c", &tmpll, &dummy) != 1) {
+        ti->error = "Invalid device sector";
+        goto bad;
+    }
+    sc->start = tmpll;
+    sc->sb_start = sc->start;
+
+    sc->sb =
+        (struct dm_security_super_block*)kzalloc(1 << SECTOR_SHIFT, GFP_KERNEL);
+    if (!sc->sb) {
+        ti->error = "Cannot allocate super block";
+        goto bad;
+    }
+
+    /* Read super block from device */
+    sb_io = super_block_io_alloc(sc);
+    if (!sb_io) {
+        ti->error = "Cannot allocate super block read io";
+        goto bad;
+    }
+    ret = super_block_io_read(sb_io);
+    if (ret < 0) {
+        super_block_io_free(sb_io);
+        ti->error = "Cannot read super block";
+        goto bad;
+    }
+
+    wait_for_completion(&sb_io->restart);
+    INIT_COMPLETION(sb_io->restart);
+
+    if (sc->sb->magic == DM_SUPER_BLOCK_MAGIC) {
+        /* Super block is valid */
+        DMINFO("Super block loaded from device sector %lu", sc->sb_start);
+        sc->data_block_bits = SECTOR_SHIFT + ffs(sc->sb->data_block_size) - 1;
+        sc->hash_block_bits = ffs(hash_block_size) - 1;
+        sc->journal_block_bits = ffs(journal_block_size) - 1;
+        sc->hash_per_block_bits =
+            ffs(hash_block_size >> (ffs(AUTHSIZE) - 1)) - 1;
+        sc->leave_per_node_bits = ffs(leave_per_node) - 1;
+        sc->journal_blocks = sc->sb->journal_area_size;
+        sc->hash_blocks = sc->sb->hash_area_size;
+        sc->data_blocks =
+            (ti->len - sc->journal_blocks - sc->hash_blocks - 1) >>
+            (sc->data_block_bits - SECTOR_SHIFT);
+        goto out;
+    }
+
+    if (!data_block_size || (data_block_size & (data_block_size - 1)) ||
+        data_block_size < bdev_logical_block_size(sc->dev->bdev) ||
+        data_block_size > PAGE_SIZE) {
+        ti->error = "Invalid data device block size";
+        ret = -EINVAL;
+        goto bad;
+    }
+    sc->data_block_bits = ffs(data_block_size) - 1;  // 4KB block
+
+    if (!hash_block_size || (hash_block_size & (hash_block_size - 1)) ||
+        hash_block_size < bdev_logical_block_size(sc->dev->bdev) ||
+        hash_block_size > PAGE_SIZE) {
+        ti->error = "Invalid hash device block size";
+        ret = -EINVAL;
+        goto bad;
+    }
+    sc->hash_block_bits = ffs(hash_block_size) - 1;  // 512B block
+    sc->hash_per_block_bits = ffs(hash_block_size >> (ffs(AUTHSIZE) - 1)) - 1;
+
+    if (!journal_block_size ||
+        (journal_block_size & (journal_block_size - 1)) ||
+        journal_block_size < bdev_logical_block_size(sc->dev->bdev) ||
+        journal_block_size > PAGE_SIZE) {
+        ti->error = "Invalid journal device block size";
+        ret = -EINVAL;
+        goto bad;
+    }
+    sc->journal_block_bits = ffs(journal_block_size) - 1;  // 512B block
+
+    sc->leave_per_node_bits = ffs(leave_per_node) - 1;  // 256 leaves per node
+
+    sc->data_blocks = ti->len >> (sc->data_block_bits - SECTOR_SHIFT);
+    if (sc->data_blocks < 1024) {
+        ti->error = "Device too small for data blocks";
+        goto bad;
+    }
+    /* 1/64 for super block, journal and hash area */
+    sc->data_blocks =
+        sc->data_blocks - (sc->data_blocks >> DEFAULT_DM_METADATA_RATIO_SHIFT);
+    sc->hash_blocks =
+        (sc->data_blocks + (sc->data_blocks >> sc->leave_per_node_bits)) >>
+        sc->hash_per_block_bits;
+    sc->journal_blocks =
+        ti->len - 1 - sc->hash_blocks -
+        (sc->data_blocks << (sc->data_block_bits - SECTOR_SHIFT));
+
+    sc->sb->magic = DM_SUPER_BLOCK_MAGIC;
+    sc->sb->journal_area_size = sc->journal_blocks;
+    sc->sb->hash_area_size = sc->hash_blocks;
+    sc->sb->data_block_size = 1 << (sc->data_block_bits - SECTOR_SHIFT);
+    // TODO : super block hmac
+
+    /* Write super block to device */
+    sb_io = super_block_io_alloc(sc);
+    if (!sb_io) {
+        ti->error = "Cannot allocate super block write io";
+        goto bad;
+    }
+    ret = super_block_io_write(sb_io);
+    if (ret < 0) {
+        super_block_io_free(sb_io);
+        ti->error = "Cannot write super block";
+        goto bad;
+    }
+
+    wait_for_completion(&sb_io->restart);
+    INIT_COMPLETION(sb_io->restart);
+    DMINFO("Super block saved to device sector %lu", sc->sb_start);
+
+out:
+    sc->journal_start = sc->sb_start + 1;
+    sc->hash_start = sc->journal_start + sc->journal_blocks;
+    sc->data_start = sc->hash_start + sc->hash_blocks;
+
+    /* Set target length to actual data blocks area size */
+    ti->len = sc->data_blocks << (sc->data_block_bits - SECTOR_SHIFT);
+
+    ret = 0;
+bad:
+    DMINFO("Target Length: %lu", ti->len);
+    DMINFO("Target Begin: %lu", ti->begin);
+    DMINFO("Super Block Start: %lu", sc->sb_start);
+    DMINFO("Journal Start: %lu", sc->journal_start);
+    DMINFO("Hash Start: %lu", sc->hash_start);
+    DMINFO("Data Start: %lu", sc->data_start);
+    DMINFO("Journal Area Size: %lu", sc->journal_blocks);
+    DMINFO("Hash Area Size: %lu", sc->hash_blocks);
+    DMINFO("Data Area Size: %lu", sc->data_blocks);
+    DMINFO("Data Block Size: %u", sc->data_block_bits);
+    DMINFO("Hash Block Size: %u", sc->hash_block_bits);
+    DMINFO("Journal Block Size: %u", sc->journal_block_bits);
+    DMINFO("Hash Per Block: %u", sc->hash_per_block_bits);
+    DMINFO("Leaves Per Node: %u", sc->leave_per_node_bits);
+
+    return ret;
+}
+
 /*
  * Construct an encryption mapping:
  * <key> <dev_path> <start>
  */
 static int security_ctr(struct dm_target* ti, unsigned int argc, char** argv) {
-    struct security_config* cc;
+    struct security_config* sc;
     unsigned int key_size;
-    unsigned long long tmpll;
     int ret;
-    char dummy;
 
     if (argc < 3) {
         ti->error = "Not enough arguments";
@@ -1120,73 +1476,73 @@ static int security_ctr(struct dm_target* ti, unsigned int argc, char** argv) {
 
     key_size = strlen(argv[0]) >> 1;
 
-    cc = kzalloc(sizeof(*cc) + key_size * sizeof(u8), GFP_KERNEL);
-    if (!cc) {
+    sc = kzalloc(sizeof(*sc) + key_size * sizeof(u8), GFP_KERNEL);
+    if (!sc) {
         ti->error = "Cannot allocate encryption context";
         return -ENOMEM;
     }
-    cc->key_size = key_size;
+    sc->key_size = key_size;
 
-    ti->private = cc;
+    ti->private = sc;
     ret = security_ctr_cipher(ti, argv[0]);
     if (ret < 0)
         goto bad;
 
     ret = -ENOMEM;
-    cc->io_pool = mempool_create_slab_pool(MIN_IOS, _security_io_pool);
-    if (!cc->io_pool) {
+    sc->io_pool = mempool_create_slab_pool(MIN_IOS, _security_io_pool);
+    if (!sc->io_pool) {
         ti->error = "Cannot allocate crypt io mempool";
         goto bad;
     }
 
-    // FIXME : alignment is removed for quick development
-    cc->dmreq_start = sizeof(struct aead_request);
-    cc->dmreq_start += crypto_aead_reqsize(cc->tfm);  // tfm ctx
+    sc->super_block_io_pool =
+        mempool_create_slab_pool(MIN_IOS, _super_block_io_pool);
+    if (!sc->super_block_io_pool) {
+        ti->error = "Cannot allocate super block io mempool";
+        goto bad;
+    }
 
-    cc->req_pool = mempool_create_kmalloc_pool(
+    // FIXME : alignment is removed for quick development
+    sc->dmreq_start = sizeof(struct aead_request);
+    sc->dmreq_start += crypto_aead_reqsize(sc->tfm);  // tfm ctx
+
+    sc->req_pool = mempool_create_kmalloc_pool(
         MIN_IOS,
-        cc->dmreq_start + sizeof(struct dm_security_request) + cc->iv_size);
-    if (!cc->req_pool) {
+        sc->dmreq_start + sizeof(struct dm_security_request) + sc->iv_size);
+    if (!sc->req_pool) {
         ti->error = "Cannot allocate crypt request mempool";
         goto bad;
     }
 
-    cc->page_pool = mempool_create_page_pool(MIN_POOL_PAGES, 0);
-    if (!cc->page_pool) {
+    sc->page_pool = mempool_create_page_pool(MIN_POOL_PAGES, 0);
+    if (!sc->page_pool) {
         ti->error = "Cannot allocate page mempool";
         goto bad;
     }
 
-    cc->bs = bioset_create(MIN_IOS, 0);
-    if (!cc->bs) {
+    sc->bs = bioset_create(MIN_IOS, 0);
+    if (!sc->bs) {
         ti->error = "Cannot allocate crypt bioset";
         goto bad;
     }
 
     ret = -EINVAL;
 
-    if (dm_get_device(ti, argv[1], dm_table_get_mode(ti->table), &cc->dev)) {
-        ti->error = "Device lookup failed";
+    ret = security_ctr_layout(ti, argv[1], argv[2]);
+    if (ret < 0)
         goto bad;
-    }
-
-    if (sscanf(argv[2], "%llu%c", &tmpll, &dummy) != 1) {
-        ti->error = "Invalid device sector";
-        goto bad;
-    }
-    cc->start = tmpll;
 
     ret = -ENOMEM;
-    cc->io_queue =
+    sc->io_queue =
         alloc_workqueue("ksecurityd_io", WQ_NON_REENTRANT | WQ_MEM_RECLAIM, 1);
-    if (!cc->io_queue) {
+    if (!sc->io_queue) {
         ti->error = "Couldn't create ksecurityd io queue";
         goto bad;
     }
 
-    cc->security_queue = alloc_workqueue(
+    sc->security_queue = alloc_workqueue(
         "ksecurityd", WQ_NON_REENTRANT | WQ_CPU_INTENSIVE | WQ_MEM_RECLAIM, 1);
-    if (!cc->security_queue) {
+    if (!sc->security_queue) {
         ti->error = "Couldn't create ksecurityd queue";
         goto bad;
     }
@@ -1203,7 +1559,7 @@ bad:
 
 static int security_map(struct dm_target* ti, struct bio* bio) {
     struct dm_security_io* io;
-    struct security_config* cc = ti->private;
+    struct security_config* sc = ti->private;
 
     /*
      * If bio is REQ_FLUSH or REQ_DISCARD, just bypass crypt queues.
@@ -1211,13 +1567,14 @@ static int security_map(struct dm_target* ti, struct bio* bio) {
      * - for REQ_DISCARD caller must use flush if IO ordering matters
      */
     if (unlikely(bio->bi_rw & (REQ_FLUSH | REQ_DISCARD))) {
-        bio->bi_bdev = cc->dev->bdev;
+        bio->bi_bdev = sc->dev->bdev;
         if (bio_sectors(bio))
-            bio->bi_sector = cc->start + dm_target_offset(ti, bio->bi_sector);
+            bio->bi_sector =
+                sc->data_start + dm_target_offset(ti, bio->bi_sector);
         return DM_MAPIO_REMAPPED;
     }
 
-    io = security_io_alloc(cc, bio, dm_target_offset(ti, bio->bi_sector));
+    io = security_io_alloc(sc, bio, dm_target_offset(ti, bio->bi_sector));
 
     if (bio_data_dir(io->base_bio) == READ) {
         if (ksecurityd_io_read(io, GFP_NOWAIT))
@@ -1229,11 +1586,11 @@ static int security_map(struct dm_target* ti, struct bio* bio) {
 }
 
 static void security_status(struct dm_target* ti,
-                         status_type_t type,
-                         unsigned status_flags,
-                         char* result,
-                         unsigned maxlen) {
-    struct security_config* cc = ti->private;
+                            status_type_t type,
+                            unsigned status_flags,
+                            char* result,
+                            unsigned maxlen) {
+    struct security_config* sc = ti->private;
     unsigned i, sz = 0;
 
     switch (type) {
@@ -1242,15 +1599,15 @@ static void security_status(struct dm_target* ti,
             break;
 
         case STATUSTYPE_TABLE:
-            DMEMIT("%s ", cc->cipher_string);
+            DMEMIT("%s ", sc->cipher_string);
 
-            if (cc->key_size > 0)
-                for (i = 0; i < cc->key_size; i++)
-                    DMEMIT("%02x", cc->key[i]);
+            if (sc->key_size > 0)
+                for (i = 0; i < sc->key_size; i++)
+                    DMEMIT("%02x", sc->key[i]);
             else
                 DMEMIT("-");
 
-            DMEMIT(" %s %llu", cc->dev->name, (unsigned long long)cc->start);
+            DMEMIT(" %s %llu", sc->dev->name, (unsigned long long)sc->start);
 
             if (ti->num_discard_bios)
                 DMEMIT(" 1 allow_discards");
@@ -1260,15 +1617,15 @@ static void security_status(struct dm_target* ti,
 }
 
 static void security_postsuspend(struct dm_target* ti) {
-    struct security_config* cc = ti->private;
+    struct security_config* sc = ti->private;
 
-    set_bit(DM_CRYPT_SUSPENDED, &cc->flags);
+    set_bit(DM_CRYPT_SUSPENDED, &sc->flags);
 }
 
 static int security_preresume(struct dm_target* ti) {
-    struct security_config* cc = ti->private;
+    struct security_config* sc = ti->private;
 
-    if (!test_bit(DM_CRYPT_KEY_VALID, &cc->flags)) {
+    if (!test_bit(DM_CRYPT_KEY_VALID, &sc->flags)) {
         DMERR("aborting resume - security key is not set.");
         return -EAGAIN;
     }
@@ -1277,9 +1634,9 @@ static int security_preresume(struct dm_target* ti) {
 }
 
 static void security_resume(struct dm_target* ti) {
-    struct security_config* cc = ti->private;
+    struct security_config* sc = ti->private;
 
-    clear_bit(DM_CRYPT_SUSPENDED, &cc->flags);
+    clear_bit(DM_CRYPT_SUSPENDED, &sc->flags);
 }
 
 /* Message interface
@@ -1287,25 +1644,25 @@ static void security_resume(struct dm_target* ti) {
  *      key wipe
  */
 static int security_message(struct dm_target* ti, unsigned argc, char** argv) {
-    struct security_config* cc = ti->private;
+    struct security_config* sc = ti->private;
     int ret = -EINVAL;
 
     if (argc < 2)
         goto error;
 
     if (!strcasecmp(argv[0], "key")) {
-        if (!test_bit(DM_CRYPT_SUSPENDED, &cc->flags)) {
+        if (!test_bit(DM_CRYPT_SUSPENDED, &sc->flags)) {
             DMWARN("not suspended during key manipulation.");
             return -EINVAL;
         }
         if (argc == 3 && !strcasecmp(argv[1], "set")) {
-            ret = security_set_key(cc, argv[2]);
+            ret = security_set_key(sc, argv[2]);
             if (ret)
                 return ret;
             return ret;
         }
         if (argc == 2 && !strcasecmp(argv[1], "wipe")) {
-            return security_wipe_key(cc);
+            return security_wipe_key(sc);
         }
     }
 
@@ -1315,27 +1672,41 @@ error:
 }
 
 static int security_merge(struct dm_target* ti,
-                       struct bvec_merge_data* bvm,
-                       struct bio_vec* biovec,
-                       int max_size) {
-    struct security_config* cc = ti->private;
-    struct request_queue* q = bdev_get_queue(cc->dev->bdev);
+                          struct bvec_merge_data* bvm,
+                          struct bio_vec* biovec,
+                          int max_size) {
+    struct security_config* sc = ti->private;
+    struct request_queue* q = bdev_get_queue(sc->dev->bdev);
 
     if (!q->merge_bvec_fn)
         return max_size;
 
-    bvm->bi_bdev = cc->dev->bdev;
-    bvm->bi_sector = cc->start + dm_target_offset(ti, bvm->bi_sector);
+    bvm->bi_bdev = sc->dev->bdev;
+    bvm->bi_sector = sc->data_start + dm_target_offset(ti, bvm->bi_sector);
 
     return min(max_size, q->merge_bvec_fn(q, bvm, biovec));
 }
 
 static int security_iterate_devices(struct dm_target* ti,
-                                 iterate_devices_callout_fn fn,
-                                 void* data) {
-    struct security_config* cc = ti->private;
+                                    iterate_devices_callout_fn fn,
+                                    void* data) {
+    struct security_config* sc = ti->private;
 
-    return fn(ti, cc->dev, cc->start, ti->len, data);
+    return fn(ti, sc->dev, sc->data_start, ti->len, data);
+}
+
+/* Set smallest block I/O size to 4KB */
+static void security_io_hints(struct dm_target* ti,
+                              struct queue_limits* limits) {
+    struct security_config* sc = ti->private;
+
+    if (limits->logical_block_size < 1 << sc->data_block_bits)
+        limits->logical_block_size = 1 << sc->data_block_bits;
+
+    if (limits->physical_block_size < 1 << sc->data_block_bits)
+        limits->physical_block_size = 1 << sc->data_block_bits;
+
+    blk_limits_io_min(limits, limits->logical_block_size);
 }
 
 static struct target_type security_target = {
@@ -1352,6 +1723,7 @@ static struct target_type security_target = {
     .message = security_message,
     .merge = security_merge,
     .iterate_devices = security_iterate_devices,
+    .io_hints = security_io_hints,
 };
 
 static int __init dm_security_init(void) {
@@ -1361,10 +1733,15 @@ static int __init dm_security_init(void) {
     if (!_security_io_pool)
         return -ENOMEM;
 
+    _super_block_io_pool = KMEM_CACHE(dm_super_block_io, 0);
+    if (!_super_block_io_pool)
+        return -ENOMEM;
+
     r = dm_register_target(&security_target);
     if (r < 0) {
         DMERR("register failed %d", r);
         kmem_cache_destroy(_security_io_pool);
+        kmem_cache_destroy(_super_block_io_pool);
     }
 
     return r;
@@ -1373,12 +1750,14 @@ static int __init dm_security_init(void) {
 static void __exit dm_security_exit(void) {
     dm_unregister_target(&security_target);
     kmem_cache_destroy(_security_io_pool);
+    kmem_cache_destroy(_super_block_io_pool);
 }
 
 module_init(dm_security_init);
 module_exit(dm_security_exit);
 
-MODULE_AUTHOR(
-    "Christophe Saout <christophe@saout.de>; Peihong Chen <mf21320017@smail.nju.edu.cn>");
-MODULE_DESCRIPTION(DM_NAME " target for transparent confidentiality and integrity");
+MODULE_AUTHOR("Christophe Saout <christophe@saout.de>");
+MODULE_AUTHOR("Peihong Chen <mf21320017@smail.nju.edu.cn>");
+MODULE_DESCRIPTION(
+    DM_NAME " target for transparent disk confidentiality and integrity");
 MODULE_LICENSE("GPL");
