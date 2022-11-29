@@ -183,7 +183,6 @@ static int kh_get_next_service_request(void) {
     pfd.events = POLLIN;
     pfd.revents = 0;
 
-    // TODO: why not epoll?
     err = poll(&pfd, 1, list_empty(&all_reqs) ? -1 : 0);
     if (err == 0 || (err && !(pfd.revents & POLLIN))) {
         return -1;

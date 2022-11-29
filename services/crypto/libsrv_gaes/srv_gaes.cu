@@ -32,6 +32,9 @@ struct kgpu_service bp4t_gecb_dec_srv;
 struct kgpu_service gxts_enc_srv;
 struct kgpu_service gxts_dec_srv;
 
+struct kgpu_service gauthenc_enc_srv;
+struct kgpu_service gauthenc_dec_srv;
+
 struct gecb_data {
     u32* d_key;
     u32* h_key;
@@ -51,10 +54,11 @@ struct gctr_data {
 /*
  * Include device code
  */
+#include "authenc.cu"
 #include "ctr.cu"
 #include "ecb.cu"
-#include "xts_hmac.cu"
 
+/* CUDA services for ECB-AES */
 int gecb_compute_size_bpt(struct kgpu_service_request* sr) {
     sr->block_x = sr->outsize >= BPT_BYTES_PER_BLOCK ? BPT_BYTES_PER_BLOCK / 16
                                                      : sr->outsize / 16;
@@ -132,6 +136,48 @@ int gecb_post(struct kgpu_service_request* sr) {
     return 0;
 }
 
+/* CUDA services for CTR-AES */
+
+#define gctr_compute_size gecb_compute_size_bpt
+#define gctr_post gecb_post
+#define gctr_prepare gecb_prepare
+
+int glctr_compute_size(struct kgpu_service_request* sr) {
+    struct crypto_gctr_info* info = (struct crypto_gctr_info*)(sr->hdata);
+    sr->block_x = info->ctr_range / 16;
+    sr->grid_x = sr->outsize / sr->block_x;
+    sr->block_y = 1;
+    sr->grid_y = 1;
+
+    return 0;
+}
+
+int gctr_launch(struct kgpu_service_request* sr) {
+    struct crypto_gctr_info* hinfo = (struct crypto_gctr_info*)(sr->hdata);
+    struct crypto_gctr_info* dinfo = (struct crypto_gctr_info*)(sr->ddata);
+
+    aes_ctr_crypt<<<dim3(sr->grid_x, sr->grid_y),
+                    dim3(sr->block_x, sr->block_y), 0,
+                    (cudaStream_t)(sr->stream)>>>((u32*)dinfo->key_enc,
+                                                  hinfo->key_length / 4 + 6,
+                                                  (u8*)sr->dout, dinfo->ctrblk);
+    return 0;
+}
+
+int glctr_launch(struct kgpu_service_request* sr) {
+    struct crypto_gctr_info* hinfo = (struct crypto_gctr_info*)(sr->hdata);
+    struct crypto_gctr_info* dinfo = (struct crypto_gctr_info*)(sr->ddata);
+
+    aes_lctr_crypt<<<dim3(sr->grid_x, sr->grid_y),
+                     dim3(sr->block_x, sr->block_y), 0,
+                     (cudaStream_t)(sr->stream)>>>(
+        (u32*)dinfo->key_enc, hinfo->key_length / 4 + 6, (u8*)sr->dout,
+        dinfo->ctrblk);
+    return 0;
+}
+
+/* CUDA services for XTS-AES */
+
 #define gxts_post gecb_post
 #define gxts_prepare gecb_prepare
 
@@ -166,46 +212,44 @@ int gxts_launch(struct kgpu_service_request* sr) {
     return 0;
 }
 
-#define gctr_compute_size gecb_compute_size_bpt
-#define gctr_post gecb_post
-#define gctr_prepare gecb_prepare
+/* CUDA services for AUTHENC-XTS-HMAC */
 
-int glctr_compute_size(struct kgpu_service_request* sr) {
-    struct crypto_gctr_info* info =
-        (struct crypto_gctr_info*)(sr->hdata);
-    sr->block_x = info->ctr_range / 16;
-    sr->grid_x = sr->outsize / sr->block_x;
+#define gauthenc_post gecb_post
+#define gauthenc_prepare gecb_prepare
+
+int gauthenc_compute_size(struct kgpu_service_request* sr) {
+    struct crypto_authenc_info* hinfo =
+        (struct crypto_authenc_info*)(sr->hdata);
+
+    sr->block_x = XTS_SECTOR_SIZE / AES_BLOCK_SIZE;
+    sr->grid_x = hinfo->textlen / XTS_SECTOR_SIZE;
     sr->block_y = 1;
     sr->grid_y = 1;
 
     return 0;
 }
 
-int gctr_launch(struct kgpu_service_request* sr) {
-    struct crypto_gctr_info* hinfo =
-        (struct crypto_gctr_info*)(sr->hdata);
-    struct crypto_gctr_info* dinfo =
-        (struct crypto_gctr_info*)(sr->ddata);
+int gauthenc_launch(struct kgpu_service_request* sr) {
+    struct crypto_authenc_info* hinfo =
+        (struct crypto_authenc_info*)(sr->hdata);
+    struct crypto_authenc_info* dinfo =
+        (struct crypto_authenc_info*)(sr->ddata);
 
-    aes_ctr_crypt<<<dim3(sr->grid_x, sr->grid_y),
-                    dim3(sr->block_x, sr->block_y), 0,
-                    (cudaStream_t)(sr->stream)>>>((u32*)dinfo->key_enc,
-                                                  hinfo->key_length / 4 + 6,
-                                                  (u8*)sr->dout, dinfo->ctrblk);
-    return 0;
-}
-
-int glctr_launch(struct kgpu_service_request* sr) {
-    struct crypto_gctr_info* hinfo =
-        (struct crypto_gctr_info*)(sr->hdata);
-    struct crypto_gctr_info* dinfo =
-        (struct crypto_gctr_info*)(sr->ddata);
-
-    aes_lctr_crypt<<<dim3(sr->grid_x, sr->grid_y),
-                     dim3(sr->block_x, sr->block_y), 0,
-                     (cudaStream_t)(sr->stream)>>>(
-        (u32*)dinfo->key_enc, hinfo->key_length / 4 + 6, (u8*)sr->dout,
-        dinfo->ctrblk);
+    if (sr->s == &gauthenc_dec_srv) {
+        xts_hmac_decrypt<<<dim3(sr->grid_x, sr->grid_y),
+                           dim3(sr->block_x, sr->block_y), 0,
+                           (cudaStream_t)(sr->stream)>>>(
+            dinfo->key_dec, dinfo->key_twk, dinfo->key_hmac,
+            2 * hinfo->keylen_enc + hinfo->keylen_auth, (uint8_t*)sr->dout,
+            hinfo->tweak, (uint8_t*)sr->dout + hinfo->textlen, 64);
+    } else {
+        xts_hmac_encrypt<<<dim3(sr->grid_x, sr->grid_y),
+                           dim3(sr->block_x, sr->block_y), 0,
+                           (cudaStream_t)(sr->stream)>>>(
+            dinfo->key_enc, dinfo->key_twk, dinfo->key_hmac,
+            2 * hinfo->keylen_enc + hinfo->keylen_auth, (uint8_t*)sr->dout,
+            hinfo->tweak, (uint8_t*)sr->dout + hinfo->textlen, 64);
+    }
     return 0;
 }
 
@@ -230,6 +274,8 @@ extern "C" int init_service(void* lh,
     cudaFuncSetCacheConfig(aes_lctr_crypt, cudaFuncCachePreferL1);
     cudaFuncSetCacheConfig(xts_decrypt, cudaFuncCachePreferL1);
     cudaFuncSetCacheConfig(xts_encrypt, cudaFuncCachePreferL1);
+    cudaFuncSetCacheConfig(xts_hmac_decrypt, cudaFuncCachePreferL1);
+    cudaFuncSetCacheConfig(xts_hmac_encrypt, cudaFuncCachePreferL1);
 
     sprintf(gecb_enc_srv.name, "gecb-enc");
     gecb_enc_srv.sid = 0;
@@ -273,12 +319,28 @@ extern "C" int init_service(void* lh,
     gxts_dec_srv.prepare = gxts_prepare;
     gxts_dec_srv.post = gxts_post;
 
+    sprintf(gauthenc_enc_srv.name, "gauthenc-enc");
+    gauthenc_enc_srv.sid = 0;
+    gauthenc_enc_srv.compute_size = gauthenc_compute_size;
+    gauthenc_enc_srv.launch = gauthenc_launch;
+    gauthenc_enc_srv.prepare = gauthenc_prepare;
+    gauthenc_enc_srv.post = gauthenc_post;
+
+    sprintf(gauthenc_dec_srv.name, "gauthenc-dec");
+    gauthenc_dec_srv.sid = 0;
+    gauthenc_dec_srv.compute_size = gauthenc_compute_size;
+    gauthenc_dec_srv.launch = gauthenc_launch;
+    gauthenc_dec_srv.prepare = gauthenc_prepare;
+    gauthenc_dec_srv.post = gauthenc_post;
+
     err = reg_srv(&gecb_enc_srv, lh);
     err |= reg_srv(&gecb_dec_srv, lh);
     err |= reg_srv(&gctr_srv, lh);
     err |= reg_srv(&glctr_srv, lh);
     err |= reg_srv(&gxts_enc_srv, lh);
     err |= reg_srv(&gxts_dec_srv, lh);
+    err |= reg_srv(&gauthenc_enc_srv, lh);
+    err |= reg_srv(&gauthenc_dec_srv, lh);
     if (err) {
         fprintf(stderr,
                 "[libsrv_gaes] Error: failed to register gaes services\n");
@@ -297,6 +359,8 @@ extern "C" int finit_service(void* lh, int (*unreg_srv)(const char*)) {
     err |= unreg_srv(glctr_srv.name);
     err |= unreg_srv(gxts_enc_srv.name);
     err |= unreg_srv(gxts_dec_srv.name);
+    err |= unreg_srv(gauthenc_enc_srv.name);
+    err |= unreg_srv(gauthenc_dec_srv.name);
     if (err) {
         fprintf(stderr,
                 "[libsrv_gaes] Error: failed to unregister gaes services\n");

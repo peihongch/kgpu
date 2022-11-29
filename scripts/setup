@@ -6,6 +6,8 @@ insmod ./dm-security.ko
 # Create a security device using dmsetup
 dmsetup create security1 --table "0 `blockdev --getsz $1` security 123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0 $1 0"
 
+# badblocks -s -w -v /dev/mapper/security1
+
 mkfs.btrfs /dev/mapper/security1 -f
 mkdir -p mnt
 mount /dev/mapper/security1 mnt

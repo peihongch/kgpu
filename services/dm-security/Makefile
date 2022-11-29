@@ -4,6 +4,8 @@
 
 obj-m += dm-security.o
 
+dm-security-objs := security-core.o security-cache.o security-hash-tree.o security-super-block.o 
+
 all:
 	make -C /lib/modules/$(shell uname -r)/build M=$(shell pwd) modules
 	$(if $(BUILD_DIR), cp dm-security.ko $(BUILD_DIR)/ ) 

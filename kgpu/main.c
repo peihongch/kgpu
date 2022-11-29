@@ -81,9 +81,10 @@ struct _kgpu_request_item {
 
 struct _kgpu_sync_call_data {
     wait_queue_head_t queue;
-    void* oldkdata;
-    kgpu_callback oldcallback;
     int done;
+    // FIXME: sync gpu call will never have req->kdata and req->callback set
+    // void* oldkdata;
+    // kgpu_callback oldcallback;
 };
 
 static atomic_t kgpudev_av = ATOMIC_INIT(1);
@@ -165,8 +166,9 @@ int kgpu_call_sync(struct kgpu_request* req) {
     }
     item->r = req;
 
-    data->oldkdata = req->kdata;
-    data->oldcallback = req->callback;
+    // FIXME: sync gpu call will never have req->kdata and req->callback set
+    // data->oldkdata = req->kdata;
+    // data->oldcallback = req->callback;
     data->done = 0;
     init_waitqueue_head(&data->queue);
 
@@ -182,10 +184,12 @@ int kgpu_call_sync(struct kgpu_request* req) {
 
     spin_unlock(&(kgpudev.reqlock));
 
+    // wait for kgpu_request to be done
     wait_event_interruptible(data->queue, (data->done == 1));
 
-    req->kdata = data->oldkdata;
-    req->callback = data->oldcallback;
+    // FIXME: sync gpu call will never have req->kdata and req->callback set
+    // req->kdata = data->oldkdata;
+    // req->callback = data->oldcallback;
     kmem_cache_free(kgpu_sync_call_data_cache, data);
 
     return 0;

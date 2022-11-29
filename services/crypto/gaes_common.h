@@ -46,4 +46,16 @@ struct crypto_xts_info {
     u64 tweak;
 };
 
+struct crypto_authenc_info {
+    u32 key_enc[AES_MAX_KEYLENGTH_U32];   /* expanded enc key for plaintext */
+    u32 key_dec[AES_MAX_KEYLENGTH_U32];   /* expanded dec key for ciphertext */
+    u32 key_twk[AES_MAX_KEYLENGTH_U32];   /* expanded enc key for tweak */
+    u32 key_hmac[HMAC_MAX_KEYLENGTH_U32]; /* raw auth key kor hmac */
+    u32 keylen_enc;                       /* xts enc/dec key length */
+    u32 keylen_auth;                      /* hmac auth key length */
+    u64 tweak;                            /* tweak used for xts */
+    u32 textlen;                          /* plaintext or ciphertex length */
+    u32 authlen;                          /* auth tag length */
+};
+
 #endif

@@ -1,0 +1,5 @@
+#!/bin/bash
+
+git add .
+git commit -m "stage my work"
+git push -u upstream

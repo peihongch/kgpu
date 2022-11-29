@@ -16,6 +16,8 @@
 #define GCTR_SIZE_THRESHOLD (1 * PAGE_SIZE)
 #define GXTS_SIZE_THRESHOLD (1 * PAGE_SIZE)
 
+#define GAUTHENC_SIZE_THRESHOLD (512)
+
 long test_gecb(size_t sz, int enc);
 long test_gctr(size_t sz);
 long test_glctr(size_t sz);

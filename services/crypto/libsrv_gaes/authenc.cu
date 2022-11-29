@@ -41,15 +41,11 @@ __global__ void xts_hmac_encrypt(uint32_t* crypt_key,
     uint32_t nrounds = AES_ROUNDS(key_len / 4);
     uint32_t hmac_key_len = key_len / 2;
     uint64_t aad[2] = {tweak + blockIdx.x, 0};
-    uint8_t digest[USHAMaxHashSize];
 
     xts_encrypt(crypt_key, tweak_key, nrounds, data, tweak);
-    // hmac_sha512(data + XTS_SECTOR_SIZE * blockIdx.x, XTS_SECTOR_SIZE,
-    //             (unsigned char*)aad, sizeof(aad), hmac_key, hmac_key_len,
-    //             mac + mac_length * blockIdx.x);
     hmac_sha512(data + XTS_SECTOR_SIZE * blockIdx.x, XTS_SECTOR_SIZE,
                 (unsigned char*)aad, sizeof(aad), (unsigned char*)hmac_key,
-                hmac_key_len, digest);
+                hmac_key_len, mac + mac_length * blockIdx.x);
 }
 
 __global__ void xts_hmac_decrypt(uint32_t* crypt_key,
@@ -63,13 +59,9 @@ __global__ void xts_hmac_decrypt(uint32_t* crypt_key,
     uint32_t nrounds = AES_ROUNDS(key_len / 4);
     uint32_t hmac_key_len = key_len / 2;
     uint64_t aad[2] = {tweak + blockIdx.x, 0};
-    uint8_t digest[USHAMaxHashSize];
 
-    // hmac_sha512(data + XTS_SECTOR_SIZE * blockIdx.x, XTS_SECTOR_SIZE,
-    //             (unsigned char*)aad, sizeof(aad), hmac_key, hmac_key_len,
-    //             mac + mac_length * blockIdx.x);
     hmac_sha512(data + XTS_SECTOR_SIZE * blockIdx.x, XTS_SECTOR_SIZE,
                 (unsigned char*)aad, sizeof(aad), (unsigned char*)hmac_key,
-                hmac_key_len, digest);
+                hmac_key_len, mac + mac_length * blockIdx.x);
     xts_decrypt(crypt_key, tweak_key, nrounds, data, tweak);
 }
