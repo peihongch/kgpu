@@ -12,10 +12,10 @@
  */
 #include <asm/byteorder.h>
 #include <asm/unaligned.h>
+#include <crypto/algapi.h>
 #include <crypto/internal/hash.h>
 #include <crypto/sha.h>
 #include <crypto/sha512_base.h>
-#include <crypto_algapi.h>
 #include <linux/crypto.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
@@ -165,6 +165,16 @@ static void sha512_generic_block_fn(struct sha512_state* sst,
     }
 }
 
+static int crypto_inc_hash_sha512_finish(struct shash_desc* desc, u8* out) {
+    unsigned int digest_size = crypto_shash_digestsize(desc->tfm);
+    struct sha512_state* sctx = shash_desc_ctx(desc);
+
+    crypto_xor(out, (const u8*)sctx->state, digest_size);
+    *sctx = (struct sha512_state){};
+
+    return 0;
+}
+
 int crypto_inc_hash_sha512_digest(struct shash_desc* desc,
                                   const u8* data,
                                   unsigned int len,
@@ -174,7 +184,7 @@ int crypto_inc_hash_sha512_digest(struct shash_desc* desc,
 
     if (ctx->old_len && ctx->old_len == len) {
         sha512_base_init(desc);
-        sha512_base_do_update(desc, (const u8*)(ctx->id), sizeof(ctx->id),
+        sha512_base_do_update(desc, (const u8*)(&ctx->id), sizeof(ctx->id),
                               sha512_generic_block_fn);
         sha512_base_do_update(desc, ctx->data, ctx->old_len,
                               sha512_generic_block_fn);
@@ -186,7 +196,7 @@ int crypto_inc_hash_sha512_digest(struct shash_desc* desc,
         return ret;
 
     sha512_base_init(desc);
-    sha512_base_do_update(desc, (const u8*)(ctx->id), sizeof(ctx->id),
+    sha512_base_do_update(desc, (const u8*)(&ctx->id), sizeof(ctx->id),
                           sha512_generic_block_fn);
     sha512_base_do_update(desc, ctx->data + ctx->old_len, len,
                           sha512_generic_block_fn);
@@ -207,11 +217,11 @@ static struct shash_alg inc_hash_sha512_alg = {
     }};
 
 static int __init inc_hash_sha512_mod_init(void) {
-    return crypto_register_shash(inc_hash_sha512_alg);
+    return crypto_register_shash(&inc_hash_sha512_alg);
 }
 
 static void __exit inc_hash_sha512_mod_fini(void) {
-    crypto_unregister_shash(inc_hash_sha512_alg);
+    crypto_unregister_shash(&inc_hash_sha512_alg);
 }
 
 module_init(inc_hash_sha512_mod_init);
