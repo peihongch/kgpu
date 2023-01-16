@@ -7,6 +7,7 @@
  * This file is released under the GPL.
  */
 #include <linux/vmalloc.h>
+#include "../trusted-storage/trusted-storage.h"
 #include "dm-security.h"
 
 #define DM_SUPER_BLOCK_MAGIC (cpu_to_be64(0x5345435552495459ULL))  // "SECURITY"
@@ -138,6 +139,8 @@ static u8* iv_of_dmreq(struct dm_security* s,
 static sector_t security_map_sector(struct dm_security* s, sector_t bi_sector) {
     return s->data_start + dm_target_offset(s->ti, bi_sector);
 }
+
+static void security_dec_pending(struct dm_security_io* io);
 
 /*
  * For KGPU: convert all blocks together for speedup
@@ -423,17 +426,6 @@ static struct bio* security_alloc_buffer(struct dm_security_io* io,
     }
 
     return clone;
-}
-
-static void security_free_buffer_pages(struct dm_security* s, struct bio* bio) {
-    unsigned int i;
-    struct bio_vec* bv;
-
-    bio_for_each_segment_all(bv, bio, i) {
-        BUG_ON(!bv->bv_page);
-        mempool_free(bv->bv_page, s->page_pool);
-        bv->bv_page = NULL;
-    }
 }
 
 static struct dm_security_io* security_io_alloc(struct dm_security* s,
@@ -1084,8 +1076,8 @@ static void security_rebuild_read_convert(struct bio* bio,
 static void security_rebuild_endio(struct bio* bio, int error) {
     struct security_rebuild_data* data = bio->bi_private;
     struct dm_security* s = data->s;
-    struct bio* hash_bio;
-    struct security_mediate_node* mn;
+    struct bio* hash_bio = NULL;
+    struct security_mediate_node* mn = NULL;
     struct inc_hash_ctx* ctx = NULL;
     unsigned rw = bio_data_dir(bio);
     unsigned digestsize = (1 << s->hash_node_bits);
@@ -1264,11 +1256,15 @@ static int security_metadata_rebuild(struct dm_target* ti, u8* root_hash) {
     down(&data.sema);
 
     /*
-     * TODO : Now all root hash and mediate nodes ready, and leaf nodes saved to
+     * Now all root hash and mediate nodes ready, and leaf nodes saved to
      * hash area, now save root hash to trusted storage (emulator)
      */
+    ret = trusted_storage_write((unsigned long)s, root_hash, digestsize);
+    if (ret) {
+        ti->error = "Cannot write root hash to trusted storage";
+        goto bad;
+    }
 
-    ret = 0;
 bad:
     return ret;
 }
@@ -1420,7 +1416,18 @@ static int security_ctr_layout(struct dm_target* ti,
     wait_for_completion(&sb_io->restart);
     DMINFO("Super block saved to device sector %lu", s->sb_start);
 
-    /* TODO : load root hash from trusted storage (emulator) */
+    /* load root hash from trusted storage (emulator) */
+    saved_root_hash = kzalloc((1 << s->hash_node_bits), GFP_KERNEL);
+    if (!saved_root_hash) {
+        ti->error = "Cannot allocate saved root hash buffer";
+        goto bad;
+    }
+    ret = trusted_storage_read((unsigned long)s, saved_root_hash,
+                               (1 << s->hash_node_bits));
+    if (ret) {
+        ti->error = "Cannot read saved root hash from trusted storage";
+        goto bad;
+    }
 
 out:
     s->hash_start = s->sb_start + 1;

@@ -368,10 +368,6 @@ struct dm_security {
 
 /* dm-security generic operations */
 void security_free_buffer_pages(struct dm_security* s, struct bio* clone);
-struct dm_security_io* security_io_alloc(struct dm_security* s,
-                                         struct bio* bio,
-                                         sector_t sector);
-void security_dec_pending(struct dm_security_io* io);
 
 /* dm-security super block related operations */
 struct security_super_block_io* security_super_block_io_alloc(
