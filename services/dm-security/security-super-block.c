@@ -1,6 +1,6 @@
 #include "dm-security.h"
 
-static void security_super_block_endio(struct bio* bio, int error) {
+void security_super_block_endio(struct bio* bio, int error) {
     struct security_super_block_io* io = bio->bi_private;
     struct dm_security* s = io->s;
     struct security_super_block* sb = s->sb;
@@ -17,11 +17,9 @@ static void security_super_block_endio(struct bio* bio, int error) {
     bio_put(bio);
 
     if (rw == READ && !error) {
-        err = crypto_shash_digest(
-            s->hmac_desc, (const u8*)&sb->journal_area_size,
-            sizeof(sb->journal_area_size) + sizeof(sb->hash_area_size) +
-                sizeof(sb->data_block_size),
-            s->hmac_digest);
+        err = crypto_shash_digest(s->hmac_desc, (const u8*)sb,
+                                  offsetof(struct security_super_block, sb_mac),
+                                  s->hmac_digest);
         if (err)
             DMWARN("Failed to calculate super block mac");
     }
@@ -35,8 +33,7 @@ static void security_super_block_endio(struct bio* bio, int error) {
     mempool_free(io, s->super_block_io_pool);
 }
 
-static void super_block_bio_init(struct security_super_block_io* io,
-                                 struct bio* bio) {
+void super_block_bio_init(struct security_super_block_io* io, struct bio* bio) {
     struct dm_security* s = io->s;
 
     bio->bi_private = io;
@@ -45,7 +42,7 @@ static void super_block_bio_init(struct security_super_block_io* io,
     bio->bi_sector = s->sb_start;
 }
 
-static struct security_super_block_io* security_super_block_io_alloc(
+struct security_super_block_io* security_super_block_io_alloc(
     struct dm_security* s) {
     struct security_super_block_io* io;
     struct bio* bio;
@@ -67,7 +64,7 @@ static struct security_super_block_io* security_super_block_io_alloc(
     return io;
 }
 
-static void security_super_block_io_free(struct security_super_block_io* io) {
+void security_super_block_io_free(struct security_super_block_io* io) {
     if (!io)
         return;
     if (io->base_bio)
@@ -75,7 +72,7 @@ static void security_super_block_io_free(struct security_super_block_io* io) {
     mempool_free(io, io->s->super_block_io_pool);
 }
 
-static int ksecurityd_super_block_io_read(struct security_super_block_io* io) {
+int ksecurityd_super_block_io_read(struct security_super_block_io* io) {
     struct dm_security* s = io->s;
     struct bio* bio = io->base_bio;
     int ret = 0;
@@ -100,8 +97,7 @@ bad:
     return ret;
 }
 
-static void ksecurityd_super_block_io_write(
-    struct security_super_block_io* io) {
+void ksecurityd_super_block_io_write(struct security_super_block_io* io) {
     struct dm_security* s = io->s;
     struct security_super_block* sb = s->sb;
     struct bio* bio = io->base_bio;
@@ -109,26 +105,24 @@ static void ksecurityd_super_block_io_write(
 
     if (!virt_addr_valid(sb)) {
         ret = -EINVAL;
-        goto bad;
+        goto out;
     }
     if (!bio_add_page(bio, virt_to_page(sb), (1 << SECTOR_SHIFT),
                       virt_to_phys(sb) & (PAGE_SIZE - 1))) {
         ret = -EINVAL;
-        goto bad;
+        goto out;
     }
 
     /* Calculate super block mac :
-     * | JA Size | HA Size | DB Size |
-     * |   8B    |   8B    |   8B    |
+     * | HA Size | DB Size |
+     * |   8B    |   8B    |
      */
-    ret = crypto_shash_digest(s->hmac_desc, (const u8*)&sb->journal_area_size,
-                              sizeof(sb->journal_area_size) +
-                                  sizeof(sb->hash_area_size) +
-                                  sizeof(sb->data_block_size),
+    ret = crypto_shash_digest(s->hmac_desc, (const u8*)sb,
+                              offsetof(struct security_super_block, sb_mac),
                               sb->sb_mac);
     if (ret) {
         DMERR("Failed to calculate super block mac");
-        goto bad;
+        goto out;
     }
 
     atomic_inc(&io->io_pending);
@@ -137,12 +131,11 @@ static void ksecurityd_super_block_io_write(
     init_completion(&io->restart);
     generic_make_request(bio);
 
-    ret = 0;
-bad:
-    return ret;
+out:
+    return;
 }
 
-static void ksecurityd_super_block(struct work_struct* work) {
+void ksecurityd_super_block(struct work_struct* work) {
     struct security_super_block_io* io =
         container_of(work, struct security_super_block_io, work);
 

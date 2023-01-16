@@ -440,15 +440,15 @@ static struct dm_security_io* security_io_alloc(struct dm_security* s,
                                                 struct bio* bio,
                                                 sector_t sector) {
     struct dm_security_io* io;
+    size_t offset = sector >> (s->data_block_bits - SECTOR_SHIFT);
+    size_t count = bio->bi_size >> s->data_block_bits;
 
     io = mempool_alloc(s->io_pool, GFP_NOIO);
     io->s = s;
     io->bio = bio;
     io->sector = sector;
     io->error = 0;
-    io->hash_io =
-        security_hash_io_alloc(s, sector >> (s->data_block_bits - SECTOR_SHIFT),
-                               bio->bi_size >> s->data_block_bits);
+    io->hash_io = security_hash_io_alloc(s, offset, count);
     io->base_io = NULL;
     atomic_set(&io->io_pending, 0);
 
@@ -700,8 +700,8 @@ static void ksecurityd_security_read_convert(struct dm_security_io* io) {
 
         if (memcmp(tag_addr, hash_addr, tag_size)) {
             io->error = -EBADMSG;
-            DMERR("tag mismatch at sector %lu, expect=%x, actual=%x",
-                  io->sector + i << (s->data_block_bits - SECTOR_SHIFT),
+            DMERR("tag mismatch at sector %lu, expect=%llx, actual=%llx",
+                  io->sector + (i << (s->data_block_bits - SECTOR_SHIFT)),
                   *(uint64_t*)hash_addr, *(uint64_t*)tag_addr);
             break;
         }
@@ -759,6 +759,7 @@ static void ksecurityd_security(struct work_struct* work) {
     struct page* page;
     gfp_t gfp_mask = GFP_NOIO | __GFP_HIGHMEM;
     unsigned int nr_iovecs;
+    int i;
 
     /* alloc hash bio to hold generated authentication tags */
     nr_iovecs =
@@ -898,75 +899,6 @@ static int security_wipe_key(struct dm_security* s) {
     return security_setkey_allcpus(s);
 }
 
-static void security_dtr(struct dm_target* ti) {
-    struct dm_security* s = ti->private;
-    struct security_cpu* cpu_sc;
-    int cpu, i;
-
-    ti->private = NULL;
-
-    if (!s)
-        return;
-
-    if (s->io_queue)
-        destroy_workqueue(s->io_queue);
-    if (s->security_queue)
-        destroy_workqueue(s->security_queue);
-    if (s->hash_queue)
-        destroy_workqueue(s->hash_queue);
-
-    security_hash_task_stop(&s->hash_flusher);
-    security_hash_task_stop(&s->hash_prefetcher);
-
-    if (s->cpu)
-        for_each_possible_cpu(cpu) {
-            cpu_sc = per_cpu_ptr(s->cpu, cpu);
-            if (cpu_sc->req)
-                mempool_free(cpu_sc->req, s->req_pool);
-        }
-
-    security_free_tfm(s);
-
-    if (s->sb)
-        kfree(s->sb);
-
-    if (s->bs)
-        bioset_free(s->bs);
-
-    if (s->page_pool)
-        mempool_destroy(s->page_pool);
-    if (s->req_pool)
-        mempool_destroy(s->req_pool);
-    if (s->io_pool)
-        mempool_destroy(s->io_pool);
-    if (s->hash_io_pool)
-        mempool_destroy(s->hash_io_pool);
-    if (s->super_block_io_pool)
-        mempool_destroy(s->super_block_io_pool);
-
-    if (s->dev)
-        dm_put_device(ti, s->dev);
-
-    if (s->cpu)
-        free_percpu(s->cpu);
-
-    for (i = 0; i < (1 << s->hash_mediate_nodes); i++) {
-        security_mediate_node_free(s->mediate_nodes[i]);
-    }
-    vfree(s->mediate_nodes);
-
-    kzfree(s->cipher_string);
-    kfree(s->hmac_digest);
-    kfree(s->hmac_desc);
-
-    if (s->hmac_tfm) {
-        crypto_free_shash(s->hmac_tfm);
-    }
-
-    /* Must zero key material before freeing */
-    kzfree(s);
-}
-
 /*
  * Workaround to parse HMAC algorithm from AEAD crypto API spec.
  * The HMAC is needed to calculate tag size (HMAC digest size).
@@ -995,7 +927,7 @@ static int security_ctr_hash_cipher(struct dm_security* s, char* inc_hash_alg) {
 
     s->hash_tfm = crypto_alloc_shash(inc_hash_alg, 0, 0);
     if (IS_ERR(s->hash_tfm))
-        return PTR_ERR(hash);
+        return PTR_ERR(s->hash_tfm);
 
     ret = -ENOMEM;
     s->hash_desc =
@@ -1236,7 +1168,6 @@ out:
  */
 static int security_metadata_rebuild(struct dm_target* ti, u8* root_hash) {
     struct dm_security* s = ti->private;
-    struct dm_security_io* io;
     struct security_rebuild_data data;
     struct inc_hash_ctx* ctx;
     struct bio* bio;
@@ -1254,8 +1185,7 @@ static int security_metadata_rebuild(struct dm_target* ti, u8* root_hash) {
     /* alloc mediate nodes buffer */
     ret = -ENOMEM;
     s->mediate_nodes =
-        vmalloc(sizeof(struct security_mediate_node*) * s->hash_mediate_nodes,
-                GFP_KERNEL);
+        vmalloc(sizeof(struct security_mediate_node*) * s->hash_mediate_nodes);
     if (!s->mediate_nodes) {
         ti->error = "Cannot allocate mediate nodes";
         goto bad;
@@ -1331,7 +1261,7 @@ static int security_metadata_rebuild(struct dm_target* ti, u8* root_hash) {
         reinit_completion(&data.restart);
     }
 
-    down(&data->sema);
+    down(&data.sema);
 
     /*
      * TODO : Now all root hash and mediate nodes ready, and leaf nodes saved to
@@ -1362,7 +1292,8 @@ static int security_ctr_layout(struct dm_target* ti,
     unsigned int data_block_size = DEFAULT_DM_DATA_BLOCK_SIZE;
     unsigned int hash_block_size = DEFAULT_DM_HASH_BLOCK_SIZE;
     unsigned int leave_per_node = DEFAULT_LEAVES_PER_NODE;
-    u8 *root_hash = NULL, saved_root_hash = NULL;
+    unsigned int digestsize = AUTHSIZE;
+    u8 *root_hash = NULL, *saved_root_hash = NULL;
     int ret = -EINVAL;
     char dummy;
 
@@ -1484,12 +1415,7 @@ static int security_ctr_layout(struct dm_target* ti,
         ti->error = "Cannot allocate super block write io";
         goto bad;
     }
-    ret = ksecurityd_super_block_io_write(sb_io);
-    if (ret < 0) {
-        security_super_block_io_free(sb_io);
-        ti->error = "Cannot write super block";
-        goto bad;
-    }
+    ksecurityd_super_block_io_write(sb_io);
 
     wait_for_completion(&sb_io->restart);
     DMINFO("Super block saved to device sector %lu", s->sb_start);
@@ -1534,8 +1460,8 @@ bad:
     DMINFO("Super Block Start: %lu", s->sb_start);
     DMINFO("Hash Start: %lu", s->hash_start);
     DMINFO("Data Start: %lu", s->data_start);
-    DMINFO("Hash Area Size: %lu", s->hash_blocks);
-    DMINFO("Data Area Size: %lu", s->data_blocks);
+    DMINFO("Hash Area Size: %u", s->hash_blocks);
+    DMINFO("Data Area Size: %u", s->data_blocks);
     DMINFO("Data Block Size: %u", s->data_block_bits);
     DMINFO("Hash Block Size: %u", s->hash_block_bits);
     DMINFO("Hash Per Block: %u", s->hash_per_block_bits);
@@ -1546,6 +1472,75 @@ bad:
 
 sb_corrupted:
     return ret;
+}
+
+static void security_dtr(struct dm_target* ti) {
+    struct dm_security* s = ti->private;
+    struct security_cpu* cpu_sc;
+    int cpu, i;
+
+    ti->private = NULL;
+
+    if (!s)
+        return;
+
+    if (s->io_queue)
+        destroy_workqueue(s->io_queue);
+    if (s->security_queue)
+        destroy_workqueue(s->security_queue);
+    if (s->hash_queue)
+        destroy_workqueue(s->hash_queue);
+
+    security_hash_task_stop(&s->hash_flusher);
+    security_hash_task_stop(&s->hash_prefetcher);
+
+    if (s->cpu)
+        for_each_possible_cpu(cpu) {
+            cpu_sc = per_cpu_ptr(s->cpu, cpu);
+            if (cpu_sc->req)
+                mempool_free(cpu_sc->req, s->req_pool);
+        }
+
+    security_free_tfm(s);
+
+    if (s->sb)
+        kfree(s->sb);
+
+    if (s->bs)
+        bioset_free(s->bs);
+
+    if (s->page_pool)
+        mempool_destroy(s->page_pool);
+    if (s->req_pool)
+        mempool_destroy(s->req_pool);
+    if (s->io_pool)
+        mempool_destroy(s->io_pool);
+    if (s->hash_io_pool)
+        mempool_destroy(s->hash_io_pool);
+    if (s->super_block_io_pool)
+        mempool_destroy(s->super_block_io_pool);
+
+    if (s->dev)
+        dm_put_device(ti, s->dev);
+
+    if (s->cpu)
+        free_percpu(s->cpu);
+
+    for (i = 0; i < (1 << s->hash_mediate_nodes); i++) {
+        security_mediate_node_free(s->mediate_nodes[i]);
+    }
+    vfree(s->mediate_nodes);
+
+    kzfree(s->cipher_string);
+    kfree(s->hmac_digest);
+    kfree(s->hmac_desc);
+
+    if (s->hmac_tfm) {
+        crypto_free_shash(s->hmac_tfm);
+    }
+
+    /* Must zero key material before freeing */
+    kzfree(s);
 }
 
 /*
@@ -1659,8 +1654,8 @@ static int security_ctr(struct dm_target* ti, unsigned int argc, char** argv) {
     if (ret < 0)
         goto bad;
 
-    init_hash_nodes_cache(s->hash_nodes_cache);
-    init_data_blocks_cache(s->data_blocks_cache, GFP_ATOMIC | GFP_KERNEL);
+    init_hash_nodes_cache(&s->hash_nodes_cache);
+    init_data_blocks_cache(&s->data_blocks_cache, GFP_ATOMIC | GFP_KERNEL);
 
     ret = security_hash_task_start(&s->hash_flusher, "hash_flusher",
                                    security_hash_flush, NULL);

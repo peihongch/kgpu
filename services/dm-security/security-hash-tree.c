@@ -2,18 +2,18 @@
 #include "../crypto/inc-hash/inc-hash.h"
 #include "dm-security.h"
 
-static inline struct security_mediate_node* security_get_mediate_node(
+inline struct security_mediate_node* security_get_mediate_node(
     struct dm_security* s,
     sector_t sector) {
     return sector >= data_area_sectors(s)
                ? NULL
-               : mediate_node_of_block(s, data_block_of_sector(sector));
+               : mediate_node_of_block(s, data_block_of_sector(s, sector));
 }
 
 /**
  * Get a number of consecutive hash tree leaves by data blocks range.
  */
-static int security_prefetch_hash_leaves(struct security_hash_io* io) {
+int security_prefetch_hash_leaves(struct security_hash_io* io) {
     struct dm_security* s = io->s;
     struct security_hash_task* prefetcher = &s->hash_prefetcher;
     struct hash_prefetch_item* item;
@@ -45,7 +45,7 @@ out:
     return ret;
 }
 
-static void security_hash_endio(struct bio* bio, int error) {
+void security_hash_endio(struct bio* bio, int error) {
     struct security_hash_io* io = bio->bi_private;
     struct dm_security* s = io->s;
     struct security_mediate_node* mn;
@@ -82,7 +82,7 @@ static void security_hash_endio(struct bio* bio, int error) {
         io->error = error;
 }
 
-static void hash_bio_init(struct security_hash_io* io, struct bio* bio) {
+void hash_bio_init(struct security_hash_io* io, struct bio* bio) {
     struct dm_security* s = io->s;
 
     bio->bi_private = io;
@@ -90,7 +90,7 @@ static void hash_bio_init(struct security_hash_io* io, struct bio* bio) {
     bio->bi_bdev = s->dev->bdev;
 }
 
-static int security_hash_alloc_buffer(struct security_hash_io* io) {
+int security_hash_alloc_buffer(struct security_hash_io* io) {
     struct dm_security* s = io->s;
     struct bio* bio;
     size_t size = io->count << s->hash_node_bits;
@@ -140,7 +140,7 @@ out:
     return ret;
 }
 
-static void security_hash_io_free(struct security_hash_io* io) {
+void security_hash_io_free(struct security_hash_io* io) {
     if (!io)
         return;
     if (io->base_bio)
@@ -148,9 +148,9 @@ static void security_hash_io_free(struct security_hash_io* io) {
     mempool_free(io, io->s->hash_io_pool);
 }
 
-static struct security_hash_io* security_hash_io_alloc(struct dm_security* s,
-                                                       size_t offset,
-                                                       size_t count) {
+struct security_hash_io* security_hash_io_alloc(struct dm_security* s,
+                                                size_t offset,
+                                                size_t count) {
     struct security_hash_io* io;
 
     io = mempool_alloc(s->hash_io_pool, GFP_NOIO);
@@ -165,9 +165,8 @@ static struct security_hash_io* security_hash_io_alloc(struct dm_security* s,
     return io;
 }
 
-static inline void hash_prefetch_item_merge(
-    struct hash_prefetch_item* item,
-    struct hash_prefetch_item* new_item) {
+inline void hash_prefetch_item_merge(struct hash_prefetch_item* item,
+                                     struct hash_prefetch_item* new_item) {
     if (item->count == 0) {
         item->start = new_item->start;
         item->count = new_item->count;
@@ -180,7 +179,7 @@ static inline void hash_prefetch_item_merge(
     list_splice(&new_item->wait_list, &item->wait_list);
 }
 
-static int ksecurityd_hash_io_read(struct security_hash_io* io, gfp_t gfp) {
+int ksecurityd_hash_io_read(struct security_hash_io* io, gfp_t gfp) {
     struct dm_security* s = io->s;
     struct bio* bio = io->base_bio;
 
@@ -197,12 +196,12 @@ static int ksecurityd_hash_io_read(struct security_hash_io* io, gfp_t gfp) {
     return 0;
 }
 
-static void ksecurityd_hash_io_write(struct security_hash_io* io) {
+void ksecurityd_hash_io_write(struct security_hash_io* io) {
     struct bio* bio = io->base_bio;
     generic_make_request(bio);
 }
 
-static void ksecurityd_hash_io(struct work_struct* work) {
+void ksecurityd_hash_io(struct work_struct* work) {
     struct security_hash_io* io =
         container_of(work, struct security_hash_io, work);
 
@@ -213,27 +212,25 @@ static void ksecurityd_hash_io(struct work_struct* work) {
         ksecurityd_hash_io_write(io);
 }
 
-static void ksecurityd_hash_queue_io(struct security_hash_io* io) {
+void ksecurityd_hash_queue_io(struct security_hash_io* io) {
     struct dm_security* s = io->s;
 
     INIT_WORK(&io->work, ksecurityd_hash_io);
     queue_work(s->io_queue, &io->work);
 }
 
-static void ksecurityd_hash_write_io_submit(struct security_hash_io* io,
-                                            int async) {
+void ksecurityd_hash_write_io_submit(struct security_hash_io* io, int async) {
     // TODO
 }
 
-static void ksecurityd_hash_write_convert(struct security_hash_io* io) {
+void ksecurityd_hash_write_convert(struct security_hash_io* io) {
     // TODO
 }
 
-static void security_leaves_cache_alloc(struct security_mediate_node* mn) {
+void security_leaves_cache_alloc(struct security_mediate_node* mn) {
     struct dm_security* s = mn->s;
-    struct hash_nodes_cache* cache = s->hash_nodes_cache;
+    struct hash_nodes_cache* cache = &s->hash_nodes_cache;
     struct security_mediate_node* evict_mn = NULL;
-    struct security_hash_task* flusher = &s->hash_flusher;
 
     mutex_lock(&cache->lock);
 
@@ -270,23 +267,23 @@ static void security_leaves_cache_alloc(struct security_mediate_node* mn) {
     mutex_unlock(&cache->lock);
 }
 
-static void security_leaves_cache_clean(struct security_mediate_node* mn) {
+void security_leaves_cache_clean(struct security_mediate_node* mn) {
     struct dm_security* s = mn->s;
     size_t i;
 
     if (!mn || !mn->leaves)
         return;
     for (i = 0; i < (1 << s->leaves_per_node_bits); i++) {
-        security_leaf_node_free(mn->leaves[i]);
+        security_leaf_node_free(&mn->leaves[i]);
     }
     kfree(mn->leaves);
     mn->leaves = NULL;
 }
 
-static void security_mediate_node_init(struct dm_security* s,
-                                       struct security_mediate_node* mn) {
+void security_mediate_node_init(struct dm_security* s,
+                                struct security_mediate_node* mn) {
     mn->s = s;
-    mn->index = mn - s->mediate_nodes;
+    mn->index = mn - s->mediate_nodes[0];
     mn->dirty = 0;
     mn->corrupted = false;
     mutex_init(&mn->lock);
@@ -294,16 +291,16 @@ static void security_mediate_node_init(struct dm_security* s,
     memset(mn->digest, 0, sizeof(mn->digest));
 }
 
-static void security_mediate_node_free(struct security_mediate_node* mn) {
+void security_mediate_node_free(struct security_mediate_node* mn) {
     if (!mn || !mn->leaves)
         return;
     security_leaves_cache_clean(mn);
     kfree(mn);
 }
 
-static void security_leaf_node_init(struct security_leaf_node* ln,
-                                    struct security_mediate_node* mn,
-                                    size_t index) {
+void security_leaf_node_init(struct security_leaf_node* ln,
+                             struct security_mediate_node* mn,
+                             size_t index) {
     ln->parent = mn;
     ln->index = index;
     ln->dirty = false;
@@ -311,7 +308,7 @@ static void security_leaf_node_init(struct security_leaf_node* ln,
     mutex_init(&ln->lock);
 }
 
-static void security_leaf_node_free(struct security_leaf_node* ln) {
+void security_leaf_node_free(struct security_leaf_node* ln) {
     struct security_mediate_node* mn;
     struct dm_security* s;
 
@@ -324,26 +321,25 @@ static void security_leaf_node_free(struct security_leaf_node* ln) {
 /**
  * Update the leaf node already in radix tree cache in mediate node
  */
-static void security_leaf_node_update(struct security_leaf_node* ln,
-                                      struct security_hash_io* io) {
-    struct security_mediate_node* mn = ln->parent;
-    struct dm_security* s = mn->s;
+void security_leaf_node_update(struct security_leaf_node* ln,
+                               struct security_hash_io* io) {
     struct bio* bio = io->base_bio;
     struct bio_vec* bvec;
-    struct bvec_iter iter;
     struct page* page;
-    unsigned int len, offset = 0;
+    void* src;
+    unsigned int i, len, offset = 0;
 
-    bio_for_each_segment(bvec, bio, iter) {
+    bio_for_each_segment(bvec, bio, i) {
         page = bvec->bv_page;
         len = bvec->bv_len;
-        memcpy(page_address(ln->page) + offset, page_address(page), len);
+        src = page_address(page) + offset_in_page(page);
+        memcpy(ln->digest + offset, src, len);
         offset += len;
     }
 }
 
 /* verify leaves using in-mem mediate node */
-static void ksecurityd_hash_read_convert(struct security_hash_io* io) {
+void ksecurityd_hash_read_convert(struct security_hash_io* io) {
     struct dm_security* s = io->s;
     struct hash_prefetch_item* item = io->prefetch;
     struct bio* bio = io->base_bio;
@@ -395,14 +391,14 @@ static void ksecurityd_hash_read_convert(struct security_hash_io* io) {
         mutex_lock(&mn->lock);
 
         for (j = 0; j < (1 << s->leaves_per_node_bits); j++) {
-            ln = mn->leaves[j];
+            ln = &mn->leaves[j];
 
             mutex_lock(&ln->lock);
 
             /* Verify the hash value of leaf node */
             ctx->id = ln->index;
             memcpy(ctx->data, ln->digest, sizeof(ln->digest));
-            crypto_shash_digest(&s->hash_tfm, (const u8*)ctx, digest_size,
+            crypto_shash_digest(s->hash_desc, (const u8*)ctx, digest_size,
                                 digest);
 
             mutex_unlock(&ln->lock);
@@ -421,7 +417,7 @@ out:
     }
 }
 
-static void ksecurityd_hash(struct work_struct* work) {
+void ksecurityd_hash(struct work_struct* work) {
     struct security_hash_io* io =
         container_of(work, struct security_hash_io, work);
 
@@ -432,21 +428,21 @@ static void ksecurityd_hash(struct work_struct* work) {
     }
 }
 
-static void ksecurityd_queue_hash(struct security_hash_io* io) {
+void ksecurityd_queue_hash(struct security_hash_io* io) {
     struct dm_security* s = io->s;
 
     INIT_WORK(&io->work, ksecurityd_hash);
     queue_work(s->hash_queue, &io->work);
 }
 
-static int security_hash_flush(void* data) {
+int security_hash_flush(void* data) {
     struct security_hash_task* sht = data;
     struct dm_security* s = container_of(sht, struct dm_security, hash_flusher);
     struct security_leaf_node *ln, *tmp;
     struct security_hash_io* io;
     struct bio* bio;
     struct rb_node *node, *start, *end;
-    size_t offset, count, index;
+    size_t offset, count = 0, index;
     int ret;
 
     while (1) {
@@ -475,8 +471,10 @@ static int security_hash_flush(void* data) {
         /* 2. Walk through hash rbtree to get adjacent items */
 
         /* Traverse left side of leaf node */
-        index = ln->index;
-        for (node = ln->flush_rb_node; node; node = rb_prev(node)) {
+        offset = index = ln->index;
+        start = &ln->flush_rb_node;
+        end = rb_next(&ln->flush_rb_node);
+        for (node = &ln->flush_rb_node; node; node = rb_prev(node)) {
             tmp = rb_entry(node, struct security_leaf_node, flush_rb_node);
             if (tmp->index != index)
                 break;
@@ -485,20 +483,20 @@ static int security_hash_flush(void* data) {
         }
         /* Traverse right side of leaf node */
         index = ln->index;
-        for (node = ln->flush_rb_node; node; node = rb_next(node)) {
+        for (node = &ln->flush_rb_node; node; node = rb_next(node)) {
             tmp = rb_entry(node, struct security_leaf_node, flush_rb_node);
+            index = tmp->index;
             if (tmp->index != index) {
                 end = node;
                 count = tmp->index - offset;
                 break;
             }
-            index = tmp->index;
-        }
+                }
 
         /* 3. Remove all adjacent items from both queue and rbtree */
 
+        count = index - offset;
         io = security_hash_io_alloc(s, offset, count);
-
         bio = bio_alloc_bioset(GFP_NOIO, count, s->bs);
         if (!bio) {
             ret = -ENOMEM;
@@ -508,10 +506,10 @@ static int security_hash_flush(void* data) {
         hash_bio_init(io, bio);
 
         for (node = start; node != end; node = rb_next(node)) {
-            ln = &rb_entry(node, struct security_leaf_node, flush_rb_node);
+            ln = rb_entry(node, struct security_leaf_node, flush_rb_node);
 
             rb_erase(node, &sht->rbtree_root);
-            list_del(ln->flush_list);
+            list_del(&ln->flush_list);
 
             bio_add_page(bio, virt_to_page(ln->digest), sizeof(ln->digest),
                          offset_in_page(ln->digest));
@@ -539,15 +537,16 @@ out:
  * Check if hash_io already in prefetch_queue, and add to queue those hash_io
  * parts not in.
  */
-static int security_hash_pre_prefetch(void* data) {
+int security_hash_pre_prefetch(void* data) {
     struct security_hash_task* sht = data;
     struct dm_security* s =
         container_of(sht, struct dm_security, hash_prefetcher);
+    struct security_mediate_node* mn;
     struct security_hash_io *io, *next;
     struct hash_prefetch_item *item, *tmp;
     struct rb_node *parent, **new;
     block_t offset, end;
-    int i, ret;
+    int ret;
 
     while (1) {
         init_completion(&sht->pre_wait);
@@ -601,7 +600,8 @@ static int security_hash_pre_prefetch(void* data) {
         /* 3. Check if already in prefetch_queue */
 
     cache_miss:
-        new = &(sht->rbtree_root->rb_node), parent = NULL;
+        new = &(sht->rbtree_root.rb_node);
+        parent = NULL;
         while (*new) {
             tmp = rb_entry(*new, struct hash_prefetch_item, rb_node);
             parent = *new;
@@ -624,7 +624,7 @@ static int security_hash_pre_prefetch(void* data) {
             list_add(&item->list, &sht->queue);
             /* Add new node and rebalance tree. */
             rb_link_node(&item->rb_node, parent, new);
-            rb_insert_color(&item->rb_node, sht->rbtree_root);
+            rb_insert_color(&item->rb_node, &sht->rbtree_root);
         }
 
         mutex_unlock(&sht->queue_lock);
@@ -637,7 +637,7 @@ out:
     return ret;
 }
 
-static int security_hash_prefetch(void* data) {
+int security_hash_prefetch(void* data) {
     struct security_hash_task* sht = data;
     struct dm_security* s =
         container_of(sht, struct dm_security, hash_prefetcher);
@@ -675,14 +675,16 @@ static int security_hash_prefetch(void* data) {
         /* 2. Walk through hash rbtree to get adjacent items */
 
         /* Traverse left side of io */
-        for (node = item->rb_node; node; node = rb_prev(node)) {
+        start = &item->rb_node;
+        end = rb_next(&item->rb_node);
+        for (node = &item->rb_node; node; node = rb_prev(node)) {
             tmp = rb_entry(node, struct hash_prefetch_item, rb_node);
             if (tmp->start + tmp->count < item->start)
                 break;
             start = node;
         }
         /* Traverse right side of io */
-        for (node = item->rb_node; node; node = rb_next(node)) {
+        for (node = &item->rb_node; node; node = rb_next(node)) {
             tmp = rb_entry(node, struct hash_prefetch_item, rb_node);
             if (tmp->start > item->start + item->count) {
                 end = node;
@@ -699,10 +701,10 @@ static int security_hash_prefetch(void* data) {
         init_hash_prefetch_item(merged, 0, 0);
 
         for (node = start; node != end; node = rb_next(node)) {
-            tmp = &rb_entry(node, struct hash_prefetch_item, rb_node);
+            tmp = rb_entry(node, struct hash_prefetch_item, rb_node);
             hash_prefetch_item_merge(merged, tmp);
             rb_erase(node, &sht->rbtree_root);
-            list_del(tmp->list);
+            list_del(&tmp->list);
             kfree(tmp);
         }
 
@@ -724,10 +726,12 @@ out:
     return ret;
 }
 
-static int security_hash_task_start(struct security_hash_task* sht,
-                                    char* name,
-                                    int (*fn)(void* data),
-                                    int (*pre_fn)(void* data)) {
+int security_hash_task_start(struct security_hash_task* sht,
+                             char* name,
+                             int (*fn)(void* data),
+                             int (*pre_fn)(void* data)) {
+    struct dm_security* s =
+        container_of(sht, struct dm_security, hash_prefetcher);
     int ret;
 
     if (!sht)
@@ -760,7 +764,7 @@ bad:
     return ret;
 }
 
-static void security_hash_task_stop(struct security_hash_task* sht) {
+void security_hash_task_stop(struct security_hash_task* sht) {
     if (!sht)
         return;
 

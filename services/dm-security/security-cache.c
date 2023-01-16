@@ -3,7 +3,7 @@
 /**
  * @return 0 on success, -errno on failure
  */
-static int security_cache_lookup(struct data_blocks_cache* cache,
+int security_cache_lookup(struct data_blocks_cache* cache,
                                  sector_t start,
                                  sector_t sectors,
                                  struct bio* bio_out) {
@@ -15,7 +15,7 @@ static int security_cache_lookup(struct data_blocks_cache* cache,
     struct security_data_block* block;
     struct bio_vec* bvec;
     void** slot;
-    int i, j, idx, offset, ret = 0;
+    unsigned int i, idx, offset, ret = 0;
 
     mutex_lock(&cache->lock);
 
@@ -33,13 +33,13 @@ static int security_cache_lookup(struct data_blocks_cache* cache,
         }
 
         /* copy cached data to bio */
-        j = bs;
-        while (j) {
+        i = bs;
+        while (i) {
             bvec = bio_iovec_idx(bio_out, idx);
             memcpy(page_address(bvec->bv_page) + bvec->bv_offset + offset,
-                   block->buf, min(j, bvec->bv_len));
-            j -= bvec->bv_len;
-            offset += j;
+                   block->buf, min(i, bvec->bv_len));
+            i -= bvec->bv_len;
+            offset += i;
             if (offset >= bvec->bv_len) {
                 offset = 0;
                 idx++;

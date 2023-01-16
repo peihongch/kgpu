@@ -4,7 +4,7 @@
 
 obj-m += dm-security.o
 
-dm-security-objs := security-core.o security-cache.o security-hash-tree.o security-super-block.o 
+dm-security-objs := security-cache.o security-hash-tree.o security-super-block.o security-core.o
 
 all:
 	make -C /lib/modules/$(shell uname -r)/build M=$(shell pwd) modules

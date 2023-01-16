@@ -46,25 +46,23 @@
 #define CIPHERMODE DEFAULT_CHAINMODE "(" DEFAULT_CIPHER ")"
 #define HMAC "hmac(" DEFAULT_HASH ")"
 #define AUTHCIPHER "gauthenc(" HMAC "," CIPHERMODE ")"
-#define AUTHSIZE 64
+#define AUTHSIZE (64)
 
 #define HASH_FLUSH_TIMEOUT (5 * HZ)
 #define HASH_PREFETCH_TIMEOUT (5 * HZ)
 
 #define HASH_NODES_CACHE_CAPACITY (256)
 
-typedef block_t unsigned int;
+typedef unsigned int block_t;
 
 /*
  * Data structure for dm-security device super block
  */
 struct security_super_block {
-    u64 magic;                       /* super block identifier - SECURITY */
-    u8 root_digest[AUTHSIZE];        /* digest of the root block */
-    u8 root_digest_backup[AUTHSIZE]; /* backup digest of the root block */
-    u64 hash_area_size;              /* size of the hash area in sectors */
-    u64 data_block_size;             /* size of the data block in sectors */
-    u8 sb_mac[AUTHSIZE];             /* hmac of super block */
+    u64 magic;           /* super block identifier - SECURITY */
+    u64 hash_area_size;  /* size of the hash area in sectors */
+    u64 data_block_size; /* size of the data block in sectors */
+    u8 sb_mac[AUTHSIZE]; /* hmac of super block */
     u8 padding[0];
 
     /* private fields used only during runtime */
@@ -247,7 +245,7 @@ struct dm_security {
     sector_t start;
 
     struct security_super_block* sb;
-    struct security_mediate_node* mediate_nodes;
+    struct security_mediate_node** mediate_nodes;
     struct security_hash_task hash_flusher;
     struct security_hash_task hash_prefetcher;
     struct hash_nodes_cache hash_nodes_cache;
@@ -369,57 +367,59 @@ struct dm_security {
     ((sector) >> ((s)->data_block_bits - SECTOR_SHIFT))
 
 /* dm-security generic operations */
-static void security_free_buffer_pages(struct dm_security* s,
-                                       struct bio* clone);
-static struct dm_security_io* security_io_alloc(struct dm_security* s,
-                                                struct bio* bio,
-                                                sector_t sector);
+void security_free_buffer_pages(struct dm_security* s, struct bio* clone);
+struct dm_security_io* security_io_alloc(struct dm_security* s,
+                                         struct bio* bio,
+                                         sector_t sector);
+void security_dec_pending(struct dm_security_io* io);
 
 /* dm-security super block related operations */
-static struct security_super_block_io* security_super_block_io_alloc(
+struct security_super_block_io* security_super_block_io_alloc(
     struct dm_security* s);
-static void security_super_block_io_free(struct security_super_block_io* io);
-static int ksecurityd_super_block_io_read(struct security_super_block_io* io);
-static void ksecurityd_super_block_io_write(struct security_super_block_io* io);
+void security_super_block_io_free(struct security_super_block_io* io);
+int ksecurityd_super_block_io_read(struct security_super_block_io* io);
+void ksecurityd_super_block_io_write(struct security_super_block_io* io);
 
 /* dm-security hash tree related operations */
-static inline struct security_mediate_node* security_get_mediate_node(
+inline struct security_mediate_node* security_get_mediate_node(
     struct dm_security* s,
     sector_t sector);
-static void security_prefetch_hash_leaves(struct security_hash_io* io);
-static struct bio* security_hash_alloc_buffer(struct security_hash_io* io);
-static void security_hash_io_free(struct security_hash_io* io);
-static struct security_hash_io* security_hash_io_alloc(struct dm_security* s,
-                                                       size_t offset);
-static void security_hash_io_merge(struct security_hash_io* io,
-                                   struct security_hash_io* new_io,
-                                   bool fast);
-static struct security_hash_io* security_hash_io_split(
-    struct security_hash_io* io,
-    size_t offset,
-    bool discard);
-static void security_mediate_node_init(struct dm_security* s,
-                                       struct security_mediate_node* mn);
-static void security_mediate_node_free(struct security_mediate_node* mn);
-static void security_leaf_node_init(struct security_leaf_node* ln,
-                                    struct security_mediate_node* mn,
-                                    size_t index);
-static void security_leaf_node_cache(struct security_leaf_node* ln);
-static void security_leaf_node_update(struct security_leaf_node* ln,
-                                      struct security_hash_io* io);
-static int security_hash_flush(void* data);
-static int security_hash_pre_prefetch(void* data);
-static int security_hash_prefetch(void* data);
-static int security_hash_task_start(struct security_hash_task* sht,
-                                    char* name,
-                                    int (*fn)(void* data),
-                                    int (*pre_fn)(void* data));
-static void security_hash_task_stop(struct security_hash_task* sht);
+int security_prefetch_hash_leaves(struct security_hash_io* io);
+int security_hash_alloc_buffer(struct security_hash_io* io);
+void security_hash_io_free(struct security_hash_io* io);
+struct security_hash_io* security_hash_io_alloc(struct dm_security* s,
+                                                size_t offset,
+                                                size_t count);
+void security_hash_io_merge(struct security_hash_io* io,
+                            struct security_hash_io* new_io,
+                            bool fast);
+struct security_hash_io* security_hash_io_split(struct security_hash_io* io,
+                                                size_t offset,
+                                                bool discard);
+void security_mediate_node_init(struct dm_security* s,
+                                struct security_mediate_node* mn);
+void security_mediate_node_free(struct security_mediate_node* mn);
+void security_leaf_node_init(struct security_leaf_node* ln,
+                             struct security_mediate_node* mn,
+                             size_t index);
+void security_leaf_node_free(struct security_leaf_node* ln);
+void security_leaf_node_cache(struct security_leaf_node* ln);
+void security_leaf_node_update(struct security_leaf_node* ln,
+                               struct security_hash_io* io);
+void ksecurityd_queue_hash(struct security_hash_io* io);
+int security_hash_flush(void* data);
+int security_hash_pre_prefetch(void* data);
+int security_hash_prefetch(void* data);
+int security_hash_task_start(struct security_hash_task* sht,
+                             char* name,
+                             int (*fn)(void* data),
+                             int (*pre_fn)(void* data));
+void security_hash_task_stop(struct security_hash_task* sht);
 
 /* dm-security data blocks cache related operations */
-static int security_cache_lookup(struct data_blocks_cache* cache,
-                                 sector_t start,
-                                 sector_t sectors,
-                                 struct bio* bio_out);
+int security_cache_lookup(struct data_blocks_cache* cache,
+                          sector_t start,
+                          sector_t sectors,
+                          struct bio* bio_out);
 
 #endif /* DM_SECURITY_H */
