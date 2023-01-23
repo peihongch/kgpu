@@ -20,26 +20,36 @@ int security_prefetch_hash_leaves(struct security_hash_io* io) {
     size_t start, count;
     int ret = 0;
 
+    pr_info("security_prefetch_hash_leaves: offset=%lu, count=%lu\n",
+            io->offset, io->count);
     item = kmalloc(sizeof(struct hash_prefetch_item), GFP_NOIO);
     if (!item) {
+        pr_info("security_prefetch_hash_leaves: kmalloc failed\n");
         ret = -ENOMEM;
         goto out;
     }
 
+    pr_info("security_prefetch_hash_leaves: offset=%lu, count=%lu\n",
+            io->offset, io->count);
     start = io->offset & (1 << s->leaves_per_node_bits);
     if (((io->offset + io->count) & (1 << s->leaves_per_node_bits)) == start)
         count = io->offset + io->count - start;
     else
         count = 2 << s->leaves_per_node_bits;
 
+    pr_info("security_prefetch_hash_leaves: init_hash_prefetch_item\n");
     init_hash_prefetch_item(item, io->offset, io->count);
     list_add(&item->wait_list, &io->list);
 
+    pr_info("security_prefetch_hash_leaves: mutex_lock\n");
     mutex_lock(&prefetcher->pre_queue_lock);
+    pr_info("security_prefetch_hash_leaves: list_add\n");
     list_add(&item->list, &prefetcher->pre_queue);
     mutex_unlock(&prefetcher->pre_queue_lock);
+    pr_info("security_prefetch_hash_leaves: mutex_unlock\n");
 
     complete(&prefetcher->pre_wait);
+    pr_info("security_prefetch_hash_leaves: complete\n");
 
 out:
     return ret;
@@ -280,24 +290,6 @@ void security_leaves_cache_clean(struct security_mediate_node* mn) {
     mn->leaves = NULL;
 }
 
-void security_mediate_node_init(struct dm_security* s,
-                                struct security_mediate_node* mn) {
-    mn->s = s;
-    mn->index = mn - s->mediate_nodes[0];
-    mn->dirty = 0;
-    mn->corrupted = false;
-    mutex_init(&mn->lock);
-    mn->leaves = NULL;
-    memset(mn->digest, 0, sizeof(mn->digest));
-}
-
-void security_mediate_node_free(struct security_mediate_node* mn) {
-    if (!mn || !mn->leaves)
-        return;
-    security_leaves_cache_clean(mn);
-    kfree(mn);
-}
-
 void security_leaf_node_init(struct security_leaf_node* ln,
                              struct security_mediate_node* mn,
                              size_t index) {
@@ -316,6 +308,61 @@ void security_leaf_node_free(struct security_leaf_node* ln) {
         return;
 
     mempool_free(ln, s->leaf_node_pool);
+}
+
+void security_mediate_node_init(struct security_mediate_node* mn) {
+    mn->dirty = 0;
+    mn->corrupted = false;
+    mutex_init(&mn->lock);
+    mn->leaves = NULL;
+    memset(mn->digest, 0, sizeof(mn->digest));
+}
+
+int security_mediate_nodes_init(struct dm_security* s) {
+    struct security_mediate_node* mn;
+    int i, ret;
+
+    ret = -ENOMEM;
+    s->mediate_nodes =
+        vmalloc(sizeof(struct security_mediate_node*) * s->hash_mediate_nodes);
+    if (!s->mediate_nodes)
+        goto bad;
+
+    for (i = 0; i < s->hash_mediate_nodes; i++) {
+        s->mediate_nodes[i] =
+            kmalloc(sizeof(struct security_mediate_node), GFP_KERNEL);
+        if (!s->mediate_nodes[i])
+            goto bad;
+
+        mn = s->mediate_nodes[i];
+        mn->index = i;
+        mn->s = s;
+        security_mediate_node_init(mn);
+    }
+
+    ret = 0;
+bad:
+    return ret;
+}
+
+void security_mediate_node_free(struct security_mediate_node* mn) {
+    if (!mn || !mn->leaves)
+        return;
+    security_leaves_cache_clean(mn);
+    kfree(mn);
+}
+
+void security_mediate_nodes_free(struct dm_security* s) {
+    int i;
+
+    if (!s->mediate_nodes)
+        return;
+
+    for (i = 0; i < s->hash_mediate_nodes; i++) {
+        security_mediate_node_free(s->mediate_nodes[i]);
+    }
+    vfree(s->mediate_nodes);
+    s->mediate_nodes = NULL;
 }
 
 /**
@@ -445,18 +492,20 @@ int security_hash_flush(void* data) {
     size_t offset, count = 0, index;
     int ret;
 
+    DMINFO("Security hash flusher started (pid %d)\n", current->pid);
+
     while (1) {
+        init_completion(&sht->wait);
+        wait_for_completion_timeout(&sht->wait, HASH_FLUSH_TIMEOUT);
+
         mutex_lock(&sht->queue_lock);
 
-        if (list_empty(&sht->queue)) {
-            /* Exit flush thread */
-            if (kthread_should_stop()) {
-                sht->stopped = true;
-                mutex_unlock(&sht->queue_lock);
-                ret = 0;
-                goto out;
-            }
-            wait_for_completion_interruptible(&sht->wait);
+        /* Exit prefetch thread */
+        if (kthread_should_stop() && list_empty(&sht->queue)) {
+            sht->stopped = true;
+            mutex_unlock(&sht->queue_lock);
+            ret = 0;
+            goto out;
         }
 
         /* 1. Get one item from queue */
@@ -491,7 +540,7 @@ int security_hash_flush(void* data) {
                 count = tmp->index - offset;
                 break;
             }
-                }
+        }
 
         /* 3. Remove all adjacent items from both queue and rbtree */
 
@@ -530,6 +579,7 @@ nomem:
     if (io)
         security_hash_io_free(io);
 out:
+    DMINFO("Security hash flusher stopped (pid %d)\n", current->pid);
     return ret;
 }
 
@@ -548,10 +598,11 @@ int security_hash_pre_prefetch(void* data) {
     block_t offset, end;
     int ret;
 
+    DMINFO("Security hash pre-prefetcher started (pid %d)\n", current->pid);
+
     while (1) {
         init_completion(&sht->pre_wait);
-        wait_for_completion_interruptible_timeout(&sht->pre_wait,
-                                                  HASH_PREFETCH_TIMEOUT);
+        wait_for_completion_timeout(&sht->pre_wait, HASH_PREFETCH_TIMEOUT);
 
         mutex_lock(&sht->pre_queue_lock);
 
@@ -567,9 +618,9 @@ int security_hash_pre_prefetch(void* data) {
 
         item = list_first_entry_or_null(&sht->pre_queue,
                                         struct hash_prefetch_item, list);
-        if (item)
+        if (item) {
             list_del(&item->list);
-        else {
+        } else {
             mutex_unlock(&sht->pre_queue_lock);
             continue;
         }
@@ -634,6 +685,7 @@ int security_hash_pre_prefetch(void* data) {
 
     ret = 0;
 out:
+    DMINFO("Security hash pre-prefetcher stopped (pid %d)\n", current->pid);
     return ret;
 }
 
@@ -647,10 +699,11 @@ int security_hash_prefetch(void* data) {
     struct rb_node *node, *start, *end;
     int ret;
 
+    DMINFO("Security hash prefetcher started (pid %d)\n", current->pid);
+
     while (1) {
         init_completion(&sht->wait);
-        wait_for_completion_interruptible_timeout(&sht->wait,
-                                                  HASH_PREFETCH_TIMEOUT);
+        wait_for_completion_timeout(&sht->wait, HASH_PREFETCH_TIMEOUT);
 
         mutex_lock(&sht->queue_lock);
 
@@ -664,9 +717,9 @@ int security_hash_prefetch(void* data) {
         /* 1. Get one item from queue */
         item = list_first_entry_or_null(&sht->queue, struct hash_prefetch_item,
                                         list);
-        if (item)
+        if (item) {
             list_del(&item->list);
-        else {
+        } else {
             mutex_unlock(&sht->queue_lock);
             continue;
         }
@@ -723,6 +776,7 @@ int security_hash_prefetch(void* data) {
     }
 
 out:
+    DMINFO("Security hash prefetcher stopped (pid %d)\n", current->pid);
     return ret;
 }
 
@@ -739,6 +793,8 @@ int security_hash_task_start(struct security_hash_task* sht,
 
     sht->stopped = false;
     sht->rbtree_root = RB_ROOT;
+    init_completion(&sht->pre_wait);
+    init_completion(&sht->wait);
     INIT_LIST_HEAD(&sht->pre_queue);
     INIT_LIST_HEAD(&sht->queue);
     mutex_init(&sht->pre_queue_lock);
@@ -768,8 +824,10 @@ void security_hash_task_stop(struct security_hash_task* sht) {
     if (!sht)
         return;
 
-    kthread_stop(sht->pre_task);
-    kthread_stop(sht->task);
+    if (sht->pre_task)
+        kthread_stop(sht->pre_task);
+    if (sht->task)
+        kthread_stop(sht->task);
     complete_all(&sht->pre_wait);
     complete_all(&sht->wait);
 }

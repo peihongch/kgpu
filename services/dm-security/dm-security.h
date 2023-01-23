@@ -37,6 +37,7 @@
 
 #include "../crypto/inc-hash/inc-hash.h"
 
+#define DM_SUPER_BLOCK_MAGIC (cpu_to_be64(0x5345435552495459ULL))  // "SECURITY"
 #define DM_MSG_PREFIX "security"
 #define DEFAULT_CIPHER "aes"
 #define DEFAULT_CHAINMODE "xts"
@@ -48,8 +49,8 @@
 #define AUTHCIPHER "gauthenc(" HMAC "," CIPHERMODE ")"
 #define AUTHSIZE (64)
 
-#define HASH_FLUSH_TIMEOUT (5 * HZ)
-#define HASH_PREFETCH_TIMEOUT (5 * HZ)
+#define HASH_FLUSH_TIMEOUT (1 * HZ)
+#define HASH_PREFETCH_TIMEOUT (1 * HZ)
 
 #define HASH_NODES_CACHE_CAPACITY (256)
 
@@ -59,10 +60,23 @@ typedef unsigned int block_t;
  * Data structure for dm-security device super block
  */
 struct security_super_block {
-    u64 magic;           /* super block identifier - SECURITY */
-    u64 hash_area_size;  /* size of the hash area in sectors */
-    u64 data_block_size; /* size of the data block in sectors */
-    u8 sb_mac[AUTHSIZE]; /* hmac of super block */
+    u64 magic; /* super block identifier - SECURITY */
+    // u64 hash_area_size;      /* size of the hash area in sectors */
+    // u64 data_area_size;      /* size of the data area in sectors */
+    u64 data_start;          /* data offset in 512B sectors */
+    u64 hash_start;          /* hash offert in 512B sectors */
+    u64 data_area_size;      /* data area size in 512B sectors */
+    u64 hash_area_size;      /* hash area size in 512B sectors */
+    u32 data_blocks;         /* number of data blocks */
+    u32 hash_blocks;         /* number of hash blocks */
+    u8 data_block_bits;      /* log2(data blocksize) */
+    u8 hash_block_bits;      /* log2(hash blocksize) */
+    u8 hash_node_bits;       /* log2(hash leaf/mediate node size) */
+    u8 hash_per_block_bits;  /* log2(hashes in hash block) */
+    u8 leaves_per_node_bits; /* log2(leaves per mediate node) */
+    u32 hash_leaf_nodes;     /* number of hash tree leaves */
+    u32 hash_mediate_nodes;  /* number of hash tree mediate nodes */
+    u8 sb_mac[AUTHSIZE];     /* hmac of super block */
     u8 padding[0];
 
     /* private fields used only during runtime */
@@ -121,7 +135,6 @@ struct security_rebuild_data {
     struct dm_security* s;
     struct completion restart; /* used for data blocks read io */
     struct semaphore sema;     /* used for leaf nodes write io */
-    struct inc_hash_ctx* ctx;
     int error;
 };
 
@@ -254,6 +267,8 @@ struct dm_security {
     sector_t sb_start;                  /* super block start in 512B sectors */
     sector_t data_start;                /* data offset in 512B sectors */
     sector_t hash_start;                /* hash offert in 512B sectors */
+    sector_t data_area_size;            /* data area size in 512B sectors */
+    sector_t hash_area_size;            /* hash area size in 512B sectors */
     block_t data_blocks;                /* number of data blocks */
     block_t hash_blocks;                /* number of hash blocks */
     unsigned char data_block_bits;      /* log2(data blocksize) */
@@ -348,6 +363,8 @@ struct dm_security {
         (item)->count = (c);                \
     } while (0)
 
+#define DIV_ROUND_UP_BITS(x, bits) (((x) + (1 << (bits)) - 1) >> (bits))
+
 #define mediate_node_idx_of_block(s, block) \
     ((block) / (1 << (s)->leaves_per_node_bits))
 #define mediate_node_of_block(s, block) \
@@ -370,6 +387,8 @@ struct dm_security {
 void security_free_buffer_pages(struct dm_security* s, struct bio* clone);
 
 /* dm-security super block related operations */
+void security_super_block_dump(struct dm_security* s);
+void security_super_block_load(struct dm_security* s);
 struct security_super_block_io* security_super_block_io_alloc(
     struct dm_security* s);
 void security_super_block_io_free(struct security_super_block_io* io);
@@ -392,9 +411,8 @@ void security_hash_io_merge(struct security_hash_io* io,
 struct security_hash_io* security_hash_io_split(struct security_hash_io* io,
                                                 size_t offset,
                                                 bool discard);
-void security_mediate_node_init(struct dm_security* s,
-                                struct security_mediate_node* mn);
-void security_mediate_node_free(struct security_mediate_node* mn);
+int security_mediate_nodes_init(struct dm_security* s);
+void security_mediate_nodes_free(struct dm_security* s);
 void security_leaf_node_init(struct security_leaf_node* ln,
                              struct security_mediate_node* mn,
                              size_t index);

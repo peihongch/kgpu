@@ -4,9 +4,9 @@
  * @return 0 on success, -errno on failure
  */
 int security_cache_lookup(struct data_blocks_cache* cache,
-                                 sector_t start,
-                                 sector_t sectors,
-                                 struct bio* bio_out) {
+                          sector_t start,
+                          sector_t sectors,
+                          struct bio* bio_out) {
     struct dm_security* s =
         container_of(cache, struct dm_security, data_blocks_cache);
     sector_t cur = start, step = 1 << (s->data_block_bits - SECTOR_SHIFT);
@@ -18,6 +18,11 @@ int security_cache_lookup(struct data_blocks_cache* cache,
     unsigned int i, idx, offset, ret = 0;
 
     mutex_lock(&cache->lock);
+
+    if (!cache->size) {
+        ret = -EIO;
+        goto out;
+    }
 
     idx = offset = 0;
     radix_tree_for_each_slot(slot, &cache->rt_root, &iter, start) {
@@ -49,6 +54,7 @@ int security_cache_lookup(struct data_blocks_cache* cache,
         cur += step;
     }
 
+out:
     mutex_unlock(&cache->lock);
 
     return ret;

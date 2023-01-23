@@ -1,5 +1,48 @@
 #include "dm-security.h"
 
+void security_super_block_dump(struct dm_security* s) {
+    struct security_super_block* sb = s->sb;
+
+    if (unlikely(!sb))
+        return;
+
+    sb->magic = DM_SUPER_BLOCK_MAGIC;
+    sb->data_start = s->data_start;
+    sb->hash_start = s->hash_start;
+    sb->data_area_size = s->data_area_size;
+    sb->hash_area_size = s->hash_area_size;
+    sb->data_blocks = s->data_blocks;
+    sb->hash_blocks = s->hash_blocks;
+    sb->data_block_bits = s->data_block_bits;
+    sb->hash_block_bits = s->hash_block_bits;
+    sb->hash_node_bits = s->hash_node_bits;
+    sb->hash_per_block_bits = s->hash_per_block_bits;
+    sb->leaves_per_node_bits = s->leaves_per_node_bits;
+    sb->hash_leaf_nodes = s->hash_leaf_nodes;
+    sb->hash_mediate_nodes = s->hash_mediate_nodes;
+}
+
+void security_super_block_load(struct dm_security* s) {
+    struct security_super_block* sb = s->sb;
+
+    if (unlikely(!sb))
+        return;
+
+    s->data_start = sb->data_start;
+    s->hash_start = sb->hash_start;
+    s->data_area_size = sb->data_area_size;
+    s->hash_area_size = sb->hash_area_size;
+    s->data_blocks = sb->data_blocks;
+    s->hash_blocks = sb->hash_blocks;
+    s->data_block_bits = sb->data_block_bits;
+    s->hash_block_bits = sb->hash_block_bits;
+    s->hash_node_bits = sb->hash_node_bits;
+    s->hash_per_block_bits = sb->hash_per_block_bits;
+    s->leaves_per_node_bits = sb->leaves_per_node_bits;
+    s->hash_leaf_nodes = sb->hash_leaf_nodes;
+    s->hash_mediate_nodes = sb->hash_mediate_nodes;
+}
+
 void security_super_block_endio(struct bio* bio, int error) {
     struct security_super_block_io* io = bio->bi_private;
     struct dm_security* s = io->s;
@@ -113,10 +156,7 @@ void ksecurityd_super_block_io_write(struct security_super_block_io* io) {
         goto out;
     }
 
-    /* Calculate super block mac :
-     * | HA Size | DB Size |
-     * |   8B    |   8B    |
-     */
+    /* Calculate super block mac from */
     ret = crypto_shash_digest(s->hmac_desc, (const u8*)sb,
                               offsetof(struct security_super_block, sb_mac),
                               sb->sb_mac);
