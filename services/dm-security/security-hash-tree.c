@@ -492,7 +492,7 @@ int security_hash_flush(void* data) {
     size_t offset, count = 0, index;
     int ret;
 
-    DMINFO("Security hash flusher started (pid %d)\n", current->pid);
+    DMINFO("Security hash flusher started (pid %d)", current->pid);
 
     while (1) {
         init_completion(&sht->wait);
@@ -579,7 +579,7 @@ nomem:
     if (io)
         security_hash_io_free(io);
 out:
-    DMINFO("Security hash flusher stopped (pid %d)\n", current->pid);
+    DMINFO("Security hash flusher stopped (pid %d)", current->pid);
     return ret;
 }
 
@@ -598,7 +598,7 @@ int security_hash_pre_prefetch(void* data) {
     block_t offset, end;
     int ret;
 
-    DMINFO("Security hash pre-prefetcher started (pid %d)\n", current->pid);
+    DMINFO("Security hash pre-prefetcher started (pid %d)", current->pid);
 
     while (1) {
         init_completion(&sht->pre_wait);
@@ -685,7 +685,7 @@ int security_hash_pre_prefetch(void* data) {
 
     ret = 0;
 out:
-    DMINFO("Security hash pre-prefetcher stopped (pid %d)\n", current->pid);
+    DMINFO("Security hash pre-prefetcher stopped (pid %d)", current->pid);
     return ret;
 }
 
@@ -699,7 +699,7 @@ int security_hash_prefetch(void* data) {
     struct rb_node *node, *start, *end;
     int ret;
 
-    DMINFO("Security hash prefetcher started (pid %d)\n", current->pid);
+    DMINFO("Security hash prefetcher started (pid %d)", current->pid);
 
     while (1) {
         init_completion(&sht->wait);
@@ -776,7 +776,7 @@ int security_hash_prefetch(void* data) {
     }
 
 out:
-    DMINFO("Security hash prefetcher stopped (pid %d)\n", current->pid);
+    DMINFO("Security hash prefetcher stopped (pid %d)", current->pid);
     return ret;
 }
 

@@ -108,6 +108,7 @@ static void security_convert_init(struct dm_security* s,
                                   sector_t sector) {
     ctx->bio_in = bio_in;
     ctx->bio_out = bio_out;
+    ctx->bio_tag = bio_tag;
     ctx->offset_in = 0;
     ctx->offset_out = 0;
     ctx->offset_tag = 0;
@@ -271,11 +272,9 @@ static int security_convert(struct dm_security* s,
 
     atomic_set(&ctx->s_pending, 1);
 
-    pr_info("security_convert: 1\n");
     while (ctx->idx_in < ctx->bio_in->bi_vcnt &&
            ctx->idx_tag < ctx->bio_tag->bi_vcnt &&
            ctx->idx_out < ctx->bio_out->bi_vcnt) {
-        pr_info("security_convert: 2\n");
         security_alloc_req(s, ctx);
 
         atomic_inc(&ctx->s_pending);
@@ -324,8 +323,6 @@ static int security_convert(struct dm_security* s,
                 return r;
         }
     }
-
-    pr_info("security_convert: 3\n");
 
     return 0;
 }
@@ -1091,11 +1088,13 @@ static void security_rebuild_read_convert(struct bio* bio,
     struct dm_security* s = data->s;
     struct convert_context ctx;
 
-    // pr_info("security_rebuild_read_convert: 1\n");
-    // security_convert_init(s, &ctx, bio, bio, hash_bio, bio->bi_sector);
+    security_convert_init(s, &ctx, bio, bio, hash_bio, bio->bi_sector);
 
-    // pr_info("security_rebuild_read_convert: 2\n");
-    // data->error = security_convert(s, &ctx);
+    data->error = security_convert(s, &ctx);
+
+    /* where is suitable to release pages and bio */
+    security_free_buffer_pages(s, bio);
+    bio_put(bio);
 }
 
 static void security_rebuild_endio(struct bio* bio, int error) {
@@ -1114,10 +1113,10 @@ static void security_rebuild_endio(struct bio* bio, int error) {
     if (unlikely(error))
         data->error = error;
 
-    if (rw == WRITE) {
+    if (rw == WRITE)
         up(&data->sema);
-        bio_put(bio);
-    }
+
+    bio_put(bio);
 
     if (rw == READ && !error)
         complete(&data->restart);
@@ -1131,10 +1130,11 @@ static int security_metadata_rebuild(struct dm_target* ti, u8* root_hash) {
     struct security_mediate_node* mn;
     struct security_rebuild_data data;
     struct inc_hash_ctx *mn_ctx = NULL, *ln_ctx = NULL, *ctx;
-    struct bio *bio = NULL, *hash_bio = NULL;
+    struct bio *bio = NULL, *clone = NULL, *hash_bio = NULL;
     struct page* page;
-    unsigned remainings =
+    unsigned totals =
         DIV_ROUND_UP_BITS(s->data_blocks << s->data_block_bits, PAGE_SHIFT);
+    unsigned remainings = totals;
     unsigned nr_iovecs;
     unsigned leaves_per_node = (1 << s->leaves_per_node_bits);
     unsigned mn_step =
@@ -1142,7 +1142,9 @@ static int security_metadata_rebuild(struct dm_target* ti, u8* root_hash) {
     unsigned ln_step = DIV_ROUND_UP_BITS(
         ((leaves_per_node >> 2) << s->data_block_bits), PAGE_SHIFT);
     unsigned digestsize = (1 << s->hash_node_bits);
-    size_t ctx_size = sizeof(struct inc_hash_ctx) + digestsize;
+    /* make ctx->data in one page */
+    size_t ctx_size =
+        roundup(sizeof(struct inc_hash_ctx) + digestsize, digestsize);
     sector_t db_step = 1 << (s->data_block_bits - SECTOR_SHIFT);
     sector_t sector = 0;
     gfp_t gfp_mask = GFP_NOIO | __GFP_HIGHMEM;
@@ -1181,9 +1183,11 @@ static int security_metadata_rebuild(struct dm_target* ti, u8* root_hash) {
         bio->bi_private = &data;
         bio->bi_end_io = security_rebuild_endio;
         bio->bi_bdev = s->dev->bdev;
-        bio->bi_sector = security_map_data_sector(s, sector);
+        bio->bi_sector = sector;
         bio->bi_rw |= READ;
-        pr_info("metadata rebuild remainings: %u\n", remainings);
+        if (unlikely(!(remainings & ((1 << 15) - 1))))
+            pr_info("metadata rebuild progress: [ %u / 100 ]\n",
+                    100 * (totals - remainings) / totals);
 
         for (j = 0; j < nr_iovecs; j++) {
             page = mempool_alloc(s->page_pool, gfp_mask);
@@ -1194,7 +1198,18 @@ static int security_metadata_rebuild(struct dm_target* ti, u8* root_hash) {
         }
         offset += nr_iovecs;
 
-        generic_make_request(bio);
+        clone = bio_clone_bioset(bio, GFP_NOIO, s->bs);
+        if (!clone) {
+            ret = -ENOMEM;
+            goto bad;
+        }
+        clone->bi_private = bio->bi_private;
+        clone->bi_end_io = bio->bi_end_io;
+        clone->bi_bdev = bio->bi_bdev;
+        clone->bi_rw = bio->bi_rw;
+        clone->bi_sector = security_map_data_sector(s, bio->bi_sector);
+
+        generic_make_request(clone);
         wait_for_completion(&data.restart);
 
         /* save leaf nodes to hash area */
@@ -1218,9 +1233,6 @@ static int security_metadata_rebuild(struct dm_target* ti, u8* root_hash) {
 
         /* decrypt data blocks and output authenticated tag to hash_bio */
         security_rebuild_read_convert(bio, hash_bio);
-        /* where is suitable to release pages and bio */
-        security_free_buffer_pages(s, bio);
-        bio_put(bio);
 
         if (data.error) {
             ret = data.error;
@@ -1260,15 +1272,10 @@ static int security_metadata_rebuild(struct dm_target* ti, u8* root_hash) {
     }
     down(&data.sema);
 
-    /*
-     * Now all root hash and mediate nodes ready, and leaf nodes saved to
-     * hash area, now save root hash to trusted storage (emulator)
-     */
-    ret = trusted_storage_write((unsigned long)s, root_hash, digestsize);
-    if (ret) {
-        ti->error = "Cannot write root hash to trusted storage";
-        goto bad;
-    }
+    DMINFO("Root Hash: %.2x %.2x %.2x %.2x %.2x %.2x %.2x %.2x", root_hash[0],
+           root_hash[1], root_hash[2], root_hash[3], root_hash[4], root_hash[5],
+           root_hash[6], root_hash[7]);
+
 bad:
     if (mn_ctx)
         kfree(mn_ctx);
@@ -1280,10 +1287,10 @@ bad:
  * | SuperBlock | Hash Area | Data Blocks |
  *
  * Super Block (512B):
- * | Magic | HA Size | DB Size | SB HMAC | Padding |
- * |  64B  |   8B    |   8B    |   64B   | (Rest)  |
+ * | Magic | Layout Params | SB HMAC | Padding |
+ * |  64B  |      ...      |   64B   | (Rest)  |
  *
- * Note: hash area stores leaf node but mediate nodes
+ * Note: hash area stores only leaf nodes
  */
 static int security_ctr_layout(struct dm_target* ti,
                                char* dev_path,
@@ -1359,15 +1366,22 @@ static int security_ctr_layout(struct dm_target* ti,
         // Load device layout params from disk super block
         security_super_block_load(s);
 
-        // pr_info("security_ctr_layout: 7.1\n");
-        // ret = trusted_storage_read((unsigned long)s, saved_root_hash,
-        //                            (1 << s->hash_node_bits));
-        // pr_info("security_ctr_layout: 7.2\n");
-        // if (ret) {
-        //     pr_info("security_ctr_layout: 7.3, ret = %d\n", ret);
-        //     ti->error = "Cannot read saved root hash from trusted storage";
-        //     goto bad;
-        // }
+        /* load root hash from trusted storage (emulator) */
+        saved_root_hash = kzalloc((1 << s->hash_node_bits), GFP_KERNEL);
+        if (!saved_root_hash) {
+            ti->error = "Cannot allocate saved root hash buffer";
+            goto bad;
+        }
+
+        pr_info("security_ctr_layout: 7.1\n");
+        ret = trusted_storage_read(s->root_hash_key, saved_root_hash,
+                                   (1 << s->hash_node_bits));
+        pr_info("security_ctr_layout: 7.2\n");
+        if (ret) {
+            pr_info("security_ctr_layout: 7.3, ret = %d\n", ret);
+            ti->error = "Cannot read saved root hash from trusted storage";
+            goto bad;
+        }
 
         goto out;
     }
@@ -1414,6 +1428,8 @@ static int security_ctr_layout(struct dm_target* ti,
     s->hash_start = s->sb_start + 1;              // hash area start sector
     s->hash_area_size = s->data_start - s->hash_start;
 
+    s->root_hash_key = trusted_storage_uuid_gen();
+
     /* Dump device layout params to super block */
     security_super_block_dump(s);
 
@@ -1427,13 +1443,6 @@ static int security_ctr_layout(struct dm_target* ti,
 
     wait_for_completion(&sb_io->restart);
     DMINFO("Super block saved to device sector %lu", s->sb_start);
-
-    /* load root hash from trusted storage (emulator) */
-    saved_root_hash = kzalloc((1 << s->hash_node_bits), GFP_KERNEL);
-    if (!saved_root_hash) {
-        ti->error = "Cannot allocate saved root hash buffer";
-        goto bad;
-    }
 
 out:
     /* Set target length to actual data blocks area size */
@@ -1453,18 +1462,32 @@ out:
         goto bad;
     }
 
-    /* check if root hashes match if not the first time loading */
-    // if (saved_root_hash &&
-    //     memcmp(root_hash, saved_root_hash, (1 << s->hash_node_bits))) {
-    //     ti->error = "Root hash not match, device data may corrupted";
-    //     ret = -EINVAL;
-    //     goto bad;
-    // }
+    if (likely(saved_root_hash)) {
+        /* check if root hashes match if not the first time loading */
+        if (memcmp(root_hash, saved_root_hash, (1 << s->hash_node_bits))) {
+            ti->error = "Root hash not match, device data may corrupted";
+            ret = -EINVAL;
+            goto bad;
+        }
+    } else {
+        /*
+         * Now all root hash and mediate nodes ready, and leaf nodes saved to
+         * hash area, now save root hash to trusted storage (emulator)
+         */
+        DMINFO("Save root hash to trusted storage with key [%lu]",
+               s->root_hash_key);
+        ret = trusted_storage_write(s->root_hash_key, root_hash, digestsize);
+        if (ret) {
+            ti->error = "Cannot write root hash to trusted storage";
+            goto bad;
+        }
+    }
 
     ret = 0;
 
 bad:
     DMINFO("===== Disk Layout Params =====");
+    DMINFO("Root Hash Key: 0x%.8lx", s->root_hash_key);
     DMINFO("Target Length: %lu", ti->len);
     DMINFO("Target Begin: %lu", ti->begin);
     DMINFO("Super Block Start: %lu", s->sb_start);

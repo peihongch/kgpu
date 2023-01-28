@@ -7,6 +7,7 @@ void security_super_block_dump(struct dm_security* s) {
         return;
 
     sb->magic = DM_SUPER_BLOCK_MAGIC;
+    sb->root_hash_key = s->root_hash_key;
     sb->data_start = s->data_start;
     sb->hash_start = s->hash_start;
     sb->data_area_size = s->data_area_size;
@@ -28,6 +29,7 @@ void security_super_block_load(struct dm_security* s) {
     if (unlikely(!sb))
         return;
 
+    s->root_hash_key = sb->root_hash_key;
     s->data_start = sb->data_start;
     s->hash_start = sb->hash_start;
     s->data_area_size = sb->data_area_size;

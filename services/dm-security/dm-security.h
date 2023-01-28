@@ -15,6 +15,7 @@
 #include <linux/completion.h>
 #include <linux/crypto.h>
 #include <linux/err.h>
+#include <linux/fs.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/kthread.h>
@@ -60,7 +61,8 @@ typedef unsigned int block_t;
  * Data structure for dm-security device super block
  */
 struct security_super_block {
-    u64 magic; /* super block identifier - SECURITY */
+    u64 magic;         /* super block identifier - SECURITY */
+    u64 root_hash_key; /* key of root hash in trusted storage */
     // u64 hash_area_size;      /* size of the hash area in sectors */
     // u64 data_area_size;      /* size of the data area in sectors */
     u64 data_start;          /* data offset in 512B sectors */
@@ -264,17 +266,18 @@ struct dm_security {
     struct hash_nodes_cache hash_nodes_cache;
     struct data_blocks_cache data_blocks_cache;
 
-    sector_t sb_start;                  /* super block start in 512B sectors */
-    sector_t data_start;                /* data offset in 512B sectors */
-    sector_t hash_start;                /* hash offert in 512B sectors */
-    sector_t data_area_size;            /* data area size in 512B sectors */
-    sector_t hash_area_size;            /* hash area size in 512B sectors */
-    block_t data_blocks;                /* number of data blocks */
-    block_t hash_blocks;                /* number of hash blocks */
-    unsigned char data_block_bits;      /* log2(data blocksize) */
-    unsigned char hash_block_bits;      /* log2(hash blocksize) */
-    unsigned char hash_node_bits;       /* log2(hash leaf/mediate node size) */
-    unsigned char hash_per_block_bits;  /* log2(hashes in hash block) */
+    unsigned long root_hash_key;       /* key of root hash in trusted storage */
+    sector_t sb_start;                 /* super block start in 512B sectors */
+    sector_t data_start;               /* data offset in 512B sectors */
+    sector_t hash_start;               /* hash offert in 512B sectors */
+    sector_t data_area_size;           /* data area size in 512B sectors */
+    sector_t hash_area_size;           /* hash area size in 512B sectors */
+    block_t data_blocks;               /* number of data blocks */
+    block_t hash_blocks;               /* number of hash blocks */
+    unsigned char data_block_bits;     /* log2(data blocksize) */
+    unsigned char hash_block_bits;     /* log2(hash blocksize) */
+    unsigned char hash_node_bits;      /* log2(hash leaf/mediate node size) */
+    unsigned char hash_per_block_bits; /* log2(hashes in hash block) */
     unsigned char leaves_per_node_bits; /* log2(leaves per mediate node) */
     unsigned int hash_leaf_nodes;       /* number of hash tree leaves */
     unsigned int hash_mediate_nodes;    /* number of hash tree mediate nodes */
