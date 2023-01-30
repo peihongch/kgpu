@@ -221,8 +221,8 @@ int gauthenc_compute_size(struct kgpu_service_request* sr) {
     struct crypto_authenc_info* hinfo =
         (struct crypto_authenc_info*)(sr->hdata);
 
-    sr->block_x = XTS_SECTOR_SIZE / AES_BLOCK_SIZE;
-    sr->grid_x = hinfo->textlen / XTS_SECTOR_SIZE;
+    sr->block_x = AUTHENC_SECTOR_SIZE / AES_BLOCK_SIZE;
+    sr->grid_x = hinfo->textlen / AUTHENC_SECTOR_SIZE;
     sr->block_y = 1;
     sr->grid_y = 1;
 

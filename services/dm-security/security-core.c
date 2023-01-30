@@ -134,19 +134,6 @@ static u8* iv_of_dmreq(struct dm_security* s,
     return (u8*)(dmreq + 1);
 }
 
-/*
- * Translate input sector number to the sector number on the target device.
- */
-static inline sector_t security_map_data_sector(struct dm_security* s,
-                                                sector_t bi_sector) {
-    return s->data_start + dm_target_offset(s->ti, bi_sector);
-}
-
-static inline sector_t security_map_hash_sector(struct dm_security* s,
-                                                sector_t bi_sector) {
-    return s->hash_start + bi_sector;
-}
-
 static void security_dec_pending(struct dm_security_io* io);
 
 /*
@@ -157,18 +144,19 @@ static int security_convert_blocks(struct dm_security* s,
                                    struct aead_request* req) {
     struct bio_vec *bv_in, *bv_out, *bv_tag;
     struct dm_security_request* dmreq;
-    uint64_t* assoc = 0;
-    unsigned int tag_size = AUTHSIZE;
-    unsigned int assoclen = sizeof(uint64_t);
-    unsigned int size = ctx->bio_in->bi_size;
-    unsigned int blocks = size >> s->data_block_bits;
+    uint64_t* assoc = NULL;
+    unsigned tag_size = hash_node_size(s);
+    unsigned assoclen = sizeof(uint64_t);
+    unsigned size = ctx->bio_in->bi_size;
+    unsigned blocks = size >> s->data_block_bits;
     u8* iv;
     int r, i;
 
     dmreq = dmreq_of_req(s, req);
     iv = iv_of_dmreq(s, dmreq);
 
-    dmreq->iv_sector = ctx->s_sector;
+    // dmreq->iv_sector = ctx->s_sector;
+    dmreq->iv_sector = ctx->s_sector >> (s->data_block_bits - SECTOR_SHIFT);
     dmreq->ctx = ctx;
 
     /* contains iv and sector, but use zeros for test now */
@@ -349,26 +337,43 @@ static void security_endio(struct bio* clone, int error) {
     struct dm_security* s = io->s;
     unsigned rw = bio_data_dir(clone);
 
+    pr_info("security_endio: 1\n");
+
     if (unlikely(!bio_flagged(clone, BIO_UPTODATE) && !error))
         error = -EIO;
+
+    pr_info(
+        "security_endio: 2, clone->bi_sector = %lu, clone->bi_size = %u, error "
+        "= %d\n",
+        clone->bi_sector, clone->bi_size, error);
 
     /*
      * free the processed pages
      */
-    if (rw == WRITE)
+    if (rw == WRITE) {
+        pr_info("security_endio: 3, rw = WRITE\n");
         security_free_buffer_pages(s, clone);
+    }
 
+    pr_info("security_endio: 4\n");
     bio_put(clone);
 
     if (rw == READ && !error) {
+        pr_info("security_endio: 5, rw = READ\n");
         ksecurityd_queue_security(io);
         return;
     }
 
+    pr_info("security_endio: 6\n");
+
     if (unlikely(error))
         io->error = error;
 
+    pr_info("security_endio: 7, io->error = %d\n", io->error);
+
     security_dec_pending(io);
+
+    pr_info("security_endio: 8\n");
 }
 
 static void clone_init(struct dm_security_io* io, struct bio* clone) {
@@ -495,11 +500,12 @@ static int ksecurityd_io_read(struct dm_security_io* io, gfp_t gfp) {
     struct bio* bio = io->bio;
     struct bio* clone;
 
-    pr_info("ksecurityd_io_read: sector=%llu, size=%u\n", bio->bi_sector,
-            bio->bi_size);
+    pr_info("ksecurityd_io_read: bio->bi_sector=%lu, bio->bi_size=%u\n",
+            bio->bi_sector, bio->bi_size);
 
     /* check if data present in cache */
-    if (!security_cache_lookup(cache, io->sector, bio->bi_size, bio)) {
+    if (!security_cache_lookup(cache, bio)) {
+        pr_info("ksecurityd_io_read: cache hit\n");
         bio_endio(bio, 0);
         return 0;
     }
@@ -517,14 +523,21 @@ static int ksecurityd_io_read(struct dm_security_io* io, gfp_t gfp) {
     if (!clone)
         return 1;
 
-    pr_info("ksecurityd_io_read: security_alloc_buffer\n");
+    pr_info(
+        "ksecurityd_io_read: security_alloc_buffer, clone->bi_sector = %lu, "
+        "clone->bi_size = %u\n",
+        clone->bi_sector, clone->bi_size);
+
     security_inc_pending(io);
 
-    pr_info("ksecurityd_io_read: clone_init\n");
+    pr_info("ksecurityd_io_read: clone_init, io->sector = %lu\n", io->sector);
     clone_init(io, clone);
-    clone->bi_sector = s->data_start + io->sector;
+    clone->bi_sector = security_map_data_sector(s, io->sector);
 
-    pr_info("ksecurityd_io_read: generic_make_request\n");
+    pr_info(
+        "ksecurityd_io_read: generic_make_request, clone->bi_sector = %lu, "
+        "clone->bi_size = %u\n",
+        clone->bi_sector, clone->bi_size);
     generic_make_request(clone);
     return 0;
 }
@@ -680,58 +693,89 @@ static void ksecurityd_security_read_done(struct dm_security_io* io) {
 static void ksecurityd_security_read_convert(struct dm_security_io* io) {
     struct dm_security* s = io->s;
     struct security_hash_io* hash_io = io->hash_io;
-    struct bio_vec *bv_tag, *bv_hash;
-    unsigned int idx_tag, idx_hash, offset_tag, offset_hash;
-    unsigned int tag_size = 1 << s->hash_node_bits;
-    void *tag_addr, *hash_addr;
+    struct bio_vec* bv_tag = NULL;
+    struct security_leaf_node* ln = NULL;
+    unsigned int idx_tag, offset_tag;
+    unsigned int tag_size = hash_node_size(s);
+    u8 *tag_addr = NULL, *hash_addr = NULL;
     int r = 0, i;
 
+    pr_info("ksecurityd_security_read_convert: 1\n");
+
     security_inc_pending(io);
+
+    pr_info("ksecurityd_security_read_convert: 2, io->sector = %lu\n",
+            io->sector);
 
     security_convert_init(s, &io->ctx, io->bio, io->bio, io->hash_bio,
                           io->sector);
 
+    pr_info("ksecurityd_security_read_convert: 3\n");
+
     r = security_convert(s, &io->ctx);
+
+    pr_info("ksecurityd_security_read_convert: 3.1, r = %d\n", r);
+
     if (r < 0)
         io->error = -EIO;
 
+    pr_info("ksecurityd_security_read_convert: 4\n");
     /* wait for hash prefetch io to complete */
-    wait_for_completion_interruptible(&hash_io->restart);
+    wait_for_completion(&hash_io->restart);
 
     /* check if tags match */
-    idx_tag = idx_hash = offset_tag = offset_hash = 0;
+    pr_info("ksecurityd_security_read_convert: 5\n");
+    idx_tag = offset_tag = 0;
     for (i = 0; i < hash_io->count; i++) {
         bv_tag = bio_iovec_idx(io->hash_bio, idx_tag);
-        bv_hash = bio_iovec_idx(hash_io->base_bio, idx_hash);
+        tag_addr =
+            page_address(bv_tag->bv_page) + bv_tag->bv_offset + offset_tag;
+        pr_info("ksecurityd_security_read_convert: 6\n");
 
-        tag_addr = page_address(bv_tag->bv_page) + offset_tag * tag_size;
-        hash_addr = page_address(bv_hash->bv_page) + offset_hash * tag_size;
+        ln = cache_get_leaf_node(s, i + hash_io->offset);
+        pr_info("ksecurityd_security_read_convert: 7, ln = %p\n", ln);
 
-        if (memcmp(tag_addr, hash_addr, tag_size)) {
-            io->error = -EBADMSG;
-            DMERR("tag mismatch at sector %lu, expect=%llx, actual=%llx",
-                  io->sector + (i << (s->data_block_bits - SECTOR_SHIFT)),
-                  *(uint64_t*)hash_addr, *(uint64_t*)tag_addr);
-            break;
+        if (ln) {
+            hash_addr = ln->digest;
+            pr_info("ksecurityd_security_read_convert: 7, hash_addr = %p\n",
+                    hash_addr);
+        } else {
+            pr_info(
+                "ksecurityd_security_read_convert: leaf node not in cache, "
+                "bypass tag checking\n");
+            continue;
         }
 
+        if (memcmp(tag_addr, hash_addr, tag_size)) {
+            DMERR(
+                "tag mismatch at sector %lu, i = %d, expect {%.2x %.2x %.2x "
+                "%.2x %.2x %.2x %.2x %.2x}, actual {%.2x %.2x %.2x %.2x %.2x "
+                "%.2x %.2x %.2x}",
+                io->sector + (i << (s->data_block_bits - SECTOR_SHIFT)), i,
+                hash_addr[0], hash_addr[1], hash_addr[2], hash_addr[3],
+                hash_addr[4], hash_addr[5], hash_addr[6], hash_addr[7],
+                tag_addr[0], tag_addr[1], tag_addr[2], tag_addr[3], tag_addr[4],
+                tag_addr[5], tag_addr[6], tag_addr[7]);
+            io->error = -EBADMSG;
+            goto out;
+        }
+
+        pr_info("ksecurityd_security_read_convert: 9\n");
         offset_tag += tag_size;
         if (offset_tag >= bv_tag->bv_len) {
             offset_tag = 0;
             idx_tag++;
         }
-
-        offset_hash += tag_size;
-        if (offset_hash >= bv_hash->bv_len) {
-            offset_hash = 0;
-            idx_hash++;
-        }
     }
 
+out:
+    pr_info("ksecurityd_security_read_convert: 10\n");
     if (atomic_dec_and_test(&io->ctx.s_pending))
         ksecurityd_security_read_done(io);
 
+    pr_info("ksecurityd_security_read_convert: 11\n");
     security_dec_pending(io);
+    pr_info("ksecurityd_security_read_convert: 12\n");
 }
 
 static void ksecurityd_async_done(struct crypto_async_request* async_req,
@@ -764,26 +808,27 @@ static void ksecurityd_security(struct work_struct* work) {
     struct dm_security_io* io = container_of(work, struct dm_security_io, work);
     struct security_hash_io* hash_io = io->hash_io;
     struct dm_security* s = io->s;
-    struct bio* bio;
-    struct page* page;
-    gfp_t gfp_mask = GFP_NOIO | __GFP_HIGHMEM;
-    unsigned int nr_iovecs;
-    int i;
+    struct bio* bio = NULL;
+    struct page* page = NULL;
+    unsigned remainings = hash_io->count << s->hash_node_bits;
+    unsigned nr_iovecs = DIV_ROUND_UP_BITS(remainings, PAGE_SHIFT);
+    unsigned len = 0;
+
+    pr_info("ksecurityd_security: start\n");
 
     /* alloc hash bio to hold generated authentication tags */
-    nr_iovecs =
-        ((hash_io->count << s->hash_node_bits) + PAGE_SIZE - 1) >> PAGE_SHIFT;
-    while (!(bio = bio_alloc_bioset(GFP_NOIO, nr_iovecs, s->bs)))
-        congestion_wait(BLK_RW_ASYNC, HZ / 100);
-    for (i = 0; i < nr_iovecs; i++) {
-        while (!(page = mempool_alloc(s->page_pool, gfp_mask)))
-            congestion_wait(BLK_RW_ASYNC, HZ / 100);
+    bio = bio_alloc_bioset(GFP_NOIO, nr_iovecs, s->bs);
+    /* NOTE : must set bio->bi_bdev before bio_add_page */
+    bio->bi_bdev = s->dev->bdev;
 
-        gfp_mask = (gfp_mask | __GFP_NOWARN) & ~__GFP_WAIT;
-        if (!bio_add_page(bio, page, PAGE_SIZE, 0)) {
+    while (nr_iovecs--) {
+        page = mempool_alloc(s->page_pool, GFP_NOIO | __GFP_HIGHMEM);
+        len = min(remainings, (unsigned)PAGE_SIZE);
+        if (!bio_add_page(bio, page, len, 0)) {
             mempool_free(page, s->page_pool);
             break;
         }
+        remainings -= len;
     }
     io->hash_bio = bio;
 
@@ -791,6 +836,8 @@ static void ksecurityd_security(struct work_struct* work) {
         ksecurityd_security_read_convert(io);
     else
         ksecurityd_security_write_convert(io);
+
+    pr_info("ksecurityd_security: end\n");
 }
 
 static void ksecurityd_queue_security(struct dm_security_io* io) {
@@ -1091,10 +1138,6 @@ static void security_rebuild_read_convert(struct bio* bio,
     security_convert_init(s, &ctx, bio, bio, hash_bio, bio->bi_sector);
 
     data->error = security_convert(s, &ctx);
-
-    /* where is suitable to release pages and bio */
-    security_free_buffer_pages(s, bio);
-    bio_put(bio);
 }
 
 static void security_rebuild_endio(struct bio* bio, int error) {
@@ -1106,7 +1149,7 @@ static void security_rebuild_endio(struct bio* bio, int error) {
 
     if (error)
         DMERR(
-            "security_rebuild_endio: I/O error %d, bi_sector %u, bi_size %u, "
+            "security_rebuild_endio: I/O error %d, bi_sector %lu, bi_size %u, "
             "rw %s",
             error, bio->bi_sector, bio->bi_size, rw == READ ? "READ" : "WRITE");
 
@@ -1141,14 +1184,13 @@ static int security_metadata_rebuild(struct dm_target* ti, u8* root_hash) {
         DIV_ROUND_UP_BITS((leaves_per_node << s->data_block_bits), PAGE_SHIFT);
     unsigned ln_step = DIV_ROUND_UP_BITS(
         ((leaves_per_node >> 2) << s->data_block_bits), PAGE_SHIFT);
-    unsigned digestsize = (1 << s->hash_node_bits);
+    unsigned digestsize = hash_node_size(s);
     /* make ctx->data in one page */
     size_t ctx_size =
         roundup(sizeof(struct inc_hash_ctx) + digestsize, digestsize);
-    sector_t db_step = 1 << (s->data_block_bits - SECTOR_SHIFT);
     sector_t sector = 0;
     gfp_t gfp_mask = GFP_NOIO | __GFP_HIGHMEM;
-    int i, j, ret = 0, offset;
+    int i, j, ret = 0, offset, ln_idx;
 
     DMINFO("Start device formatting to build metadata");
 
@@ -1175,6 +1217,7 @@ static int security_metadata_rebuild(struct dm_target* ti, u8* root_hash) {
     /* FIXME : make it more efficient? */
     i = 0;
     offset = 0;
+    ln_idx = 0;
     while (remainings) {
         init_completion(&data.restart);
         /* alloc data bio */
@@ -1233,6 +1276,9 @@ static int security_metadata_rebuild(struct dm_target* ti, u8* root_hash) {
 
         /* decrypt data blocks and output authenticated tag to hash_bio */
         security_rebuild_read_convert(bio, hash_bio);
+        /* where is suitable to release pages and bio */
+        security_free_buffer_pages(s, bio);
+        bio_put(bio);
 
         if (data.error) {
             ret = data.error;
@@ -1246,7 +1292,8 @@ static int security_metadata_rebuild(struct dm_target* ti, u8* root_hash) {
         /* calculate mediate node hash value */
         for (j = 0; j < nr_iovecs; j++) {
             ctx = (void*)ln_ctx + j * ctx_size;
-            ctx->id = sector + j * db_step;
+            /* use leaf node index as inc hash id instead of block sector */
+            ctx->id = ln_idx++;
             ctx->old_len = 0;
             ret = crypto_shash_digest(s->hash_desc, (const u8*)ctx, digestsize,
                                       mn->digest);
@@ -1367,18 +1414,15 @@ static int security_ctr_layout(struct dm_target* ti,
         security_super_block_load(s);
 
         /* load root hash from trusted storage (emulator) */
-        saved_root_hash = kzalloc((1 << s->hash_node_bits), GFP_KERNEL);
+        saved_root_hash = kzalloc(hash_node_size(s), GFP_KERNEL);
         if (!saved_root_hash) {
             ti->error = "Cannot allocate saved root hash buffer";
             goto bad;
         }
 
-        pr_info("security_ctr_layout: 7.1\n");
         ret = trusted_storage_read(s->root_hash_key, saved_root_hash,
-                                   (1 << s->hash_node_bits));
-        pr_info("security_ctr_layout: 7.2\n");
+                                   hash_node_size(s));
         if (ret) {
-            pr_info("security_ctr_layout: 7.3, ret = %d\n", ret);
             ti->error = "Cannot read saved root hash from trusted storage";
             goto bad;
         }
@@ -1464,7 +1508,7 @@ out:
 
     if (likely(saved_root_hash)) {
         /* check if root hashes match if not the first time loading */
-        if (memcmp(root_hash, saved_root_hash, (1 << s->hash_node_bits))) {
+        if (memcmp(root_hash, saved_root_hash, hash_node_size(s))) {
             ti->error = "Root hash not match, device data may corrupted";
             ret = -EINVAL;
             goto bad;
@@ -1494,7 +1538,8 @@ bad:
     DMINFO("Hash Start: %lu", s->hash_start);
     DMINFO("Hash Area Size: %lu", s->data_start - s->hash_start);
     DMINFO("Data Start: %lu", s->data_start);
-    DMINFO("Data Area Size: %lu", s->data_blocks << s->data_block_bits);
+    DMINFO("Data Area Size: %lu",
+           s->data_blocks << (s->data_block_bits - SECTOR_SHIFT));
     DMINFO("Hash Blocks: %u", s->hash_blocks);
     DMINFO("Data Blocks: %u", s->data_blocks);
     DMINFO("Data Block Size: %u", 1 << s->data_block_bits);
@@ -1691,17 +1736,12 @@ static int security_ctr(struct dm_target* ti, unsigned int argc, char** argv) {
     ti->num_flush_bios = 1;
     ti->discard_zeroes_data_unsupported = true;
 
-    pr_info("security_ctr: 10\n");
     ret = security_ctr_layout(ti, argv[1], argv[2]);
-    pr_info("security_ctr: 11\n");
     if (ret < 0)
         goto bad;
 
-    pr_info("security_ctr: 12\n");
     init_hash_nodes_cache(&s->hash_nodes_cache);
-    pr_info("security_ctr: 13\n");
     init_data_blocks_cache(&s->data_blocks_cache, GFP_ATOMIC | GFP_KERNEL);
-    pr_info("security_ctr: 14\n");
 
     ret = security_hash_task_start(&s->hash_flusher, "hash_flusher",
                                    security_hash_flush, NULL);
@@ -1709,24 +1749,19 @@ static int security_ctr(struct dm_target* ti, unsigned int argc, char** argv) {
         ti->error = "Cannot start hash flush task";
         goto bad;
     }
-    pr_info("security_ctr: 15\n");
 
     ret = security_hash_task_start(&s->hash_prefetcher, "hash_prefetcher",
                                    security_hash_prefetch,
                                    security_hash_pre_prefetch);
-    pr_info("security_ctr: 17\n");
     if (ret < 0) {
         ti->error = "Cannot start hash prefetch task";
         goto bad;
     }
-    pr_info("security_ctr: 18\n");
 
     return 0;
 
 bad:
-    pr_info("security_ctr: 19\n");
     security_dtr(ti);
-    pr_info("security_ctr: 20\n");
     return ret;
 }
 
@@ -1734,9 +1769,7 @@ static int security_map(struct dm_target* ti, struct bio* bio) {
     struct dm_security_io* io;
     struct dm_security* s = ti->private;
 
-    bio_endio(bio, 0);
-    return 0;
-
+    pr_info("security_map: 1\n");
     /*
      * If bio is REQ_FLUSH or REQ_DISCARD, just bypass crypt queues.
      * - for REQ_FLUSH device-mapper core ensures that no IO is in-flight
@@ -1750,10 +1783,11 @@ static int security_map(struct dm_target* ti, struct bio* bio) {
         return DM_MAPIO_REMAPPED;
     }
 
-    pr_info("security_map: 3\n");
+    pr_info("security_map: 3, bio->bi_sector = %lu, dm_target_offset = %u\n",
+            bio->bi_sector, dm_target_offset(ti, bio->bi_sector));
     io = security_io_alloc(s, bio, dm_target_offset(ti, bio->bi_sector));
 
-    pr_info("security_map: 4\n");
+    pr_info("security_map: 4, io->sector = %lu\n", io->sector);
     if (bio_data_dir(io->bio) == READ) {
         pr_info("security_map: 5\n");
         if (ksecurityd_io_read(io, GFP_NOWAIT)) {

@@ -90,10 +90,11 @@ struct security_mediate_node {
     size_t index;
     size_t dirty;   /* Number of modified leaf nodes in cache */
     bool corrupted; /* Indicate if leaf nodes in cache passed verification */
+    bool cached;    /* Indicate if leaf nodes in cache */
     struct dm_security* s;
     struct mutex lock;
     struct list_head lru_item;
-    struct security_leaf_node* leaves; /* Cached leaf nodes if not NULL */
+    struct security_leaf_node** leaves; /* Cached leaf nodes if not NULL */
     /*
      * TODO : Make the digests of all mediate nodes continuous in physical
      * memory to gain better IO performance ?
@@ -184,7 +185,7 @@ struct security_hash_io {
 
     atomic_t io_pending;
     int error;
-    size_t offset; /* leaf/mediate node index of hash tree */
+    size_t offset; /* leaf node index of hash tree */
     size_t count;  /* number of leaf nodes to read/write */
     struct completion restart;
     struct security_hash_io* base_io;
@@ -367,14 +368,16 @@ struct dm_security {
     } while (0)
 
 #define DIV_ROUND_UP_BITS(x, bits) (((x) + (1 << (bits)) - 1) >> (bits))
+#define MASK_BITS(x, bits) ((x) & ((1 << (bits)) - 1))
+#define UMASK_BITS(x, bits) ((x) & ~((1 << (bits)) - 1))
 
 #define mediate_node_idx_of_block(s, block) \
     ((block) / (1 << (s)->leaves_per_node_bits))
 #define mediate_node_of_block(s, block) \
     ((s)->mediate_nodes[mediate_node_idx_of_block((s), (block))])
-#define leaf_node_of_block(s, block)               \
-    (mediate_node_of_block((s), (block))->leaves + \
-     ((block) & ((1 << (s)->leaves_per_node_bits) - 1)))
+#define leaf_node_of_block(s, block)     \
+    (mediate_node_of_block((s), (block)) \
+         ->leaves[((block) & ((1 << (s)->leaves_per_node_bits) - 1))])
 /* leaf sector in hash area */
 #define leaf_sector_of_block(s, block) ((block) >> (s)->hash_per_block_bits)
 
@@ -387,9 +390,13 @@ struct dm_security {
     ((sector) >> ((s)->data_block_bits - SECTOR_SHIFT))
 
 /* dm-security generic operations */
-void security_free_buffer_pages(struct dm_security* s, struct bio* clone);
+
+void security_free_buffer_pages(struct dm_security* s, struct bio* bio);
+sector_t security_map_data_sector(struct dm_security* s, sector_t bi_sector);
+sector_t security_map_hash_sector(struct dm_security* s, sector_t bi_sector);
 
 /* dm-security super block related operations */
+
 void security_super_block_dump(struct dm_security* s);
 void security_super_block_load(struct dm_security* s);
 struct security_super_block_io* security_super_block_io_alloc(
@@ -399,9 +406,12 @@ int ksecurityd_super_block_io_read(struct security_super_block_io* io);
 void ksecurityd_super_block_io_write(struct security_super_block_io* io);
 
 /* dm-security hash tree related operations */
+
 inline struct security_mediate_node* security_get_mediate_node(
     struct dm_security* s,
     sector_t sector);
+struct security_leaf_node* cache_get_leaf_node(struct dm_security* s,
+                                               size_t index);
 int security_prefetch_hash_leaves(struct security_hash_io* io);
 int security_hash_alloc_buffer(struct security_hash_io* io);
 void security_hash_io_free(struct security_hash_io* io);
@@ -434,9 +444,7 @@ int security_hash_task_start(struct security_hash_task* sht,
 void security_hash_task_stop(struct security_hash_task* sht);
 
 /* dm-security data blocks cache related operations */
-int security_cache_lookup(struct data_blocks_cache* cache,
-                          sector_t start,
-                          sector_t sectors,
-                          struct bio* bio_out);
+
+int security_cache_lookup(struct data_blocks_cache* cache, struct bio* bio);
 
 #endif /* DM_SECURITY_H */

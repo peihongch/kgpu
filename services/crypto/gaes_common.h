@@ -46,6 +46,8 @@ struct crypto_xts_info {
     u64 tweak;
 };
 
+#define AUTHENC_SECTOR_SIZE 4096
+
 struct crypto_authenc_info {
     u32 key_enc[AES_MAX_KEYLENGTH_U32];   /* expanded enc key for plaintext */
     u32 key_dec[AES_MAX_KEYLENGTH_U32];   /* expanded dec key for ciphertext */
