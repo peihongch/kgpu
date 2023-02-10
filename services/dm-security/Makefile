@@ -4,7 +4,7 @@
 
 obj-m += dm-security.o
 
-dm-security-objs := security-common.o security-cache.o security-hash-tree.o security-super-block.o security-core.o
+dm-security-objs := security-common.o security-convert.o security-cache.o security-hash-tree.o security-super-block.o security-core.o
 
 # 
 # 内核模块编译时搜索Module.symvers的路径是：

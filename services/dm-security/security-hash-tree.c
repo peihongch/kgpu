@@ -111,7 +111,6 @@ void security_hash_endio(struct bio* bio, int error) {
 
     /* queue hash io to verify leaf node using related mediate node */
     if (rw == READ && !error) {
-        // pr_info("security_hash_endio: ksecurityd_queue_hash(io);\n");
         ksecurityd_queue_hash(io);
         return;
     }
@@ -159,7 +158,7 @@ retry:
     }
 
     hash_bio_init(io, bio);
-    io->base_bio = bio;
+    io->bio = bio;
 
     remaining_size = size;
 
@@ -202,9 +201,9 @@ void security_hash_io_free(struct security_hash_io* io) {
     if (!io)
         return;
 
-    if (io->base_bio) {
-        security_free_buffer_pages(io->s, io->base_bio);
-        bio_put(io->base_bio);
+    if (io->bio) {
+        security_free_buffer_pages(io->s, io->bio);
+        bio_put(io->bio);
     }
 
     mempool_free(io, io->s->hash_io_pool);
@@ -221,7 +220,7 @@ struct security_hash_io* security_hash_io_alloc(struct dm_security* s,
     io->count = count;
     io->error = 0;
     io->prefetch = NULL;
-    io->base_bio = NULL;
+    io->bio = NULL;
     init_completion(&io->restart);
     atomic_set(&io->io_pending, 1);
 
@@ -244,7 +243,7 @@ inline void hash_prefetch_item_merge(struct hash_prefetch_item* item,
 
 int ksecurityd_hash_io_read(struct security_hash_io* io, gfp_t gfp) {
     struct dm_security* s = io->s;
-    struct bio* bio = io->base_bio;
+    struct bio* bio = io->bio;
 
     bio->bi_sector = security_map_hash_sector(
         s, io->offset >> (SECTOR_SHIFT - s->hash_node_bits));
@@ -260,7 +259,7 @@ int ksecurityd_hash_io_read(struct security_hash_io* io, gfp_t gfp) {
 
 void ksecurityd_hash_io_write(struct security_hash_io* io) {
     struct dm_security* s = io->s;
-    struct bio* bio = io->base_bio;
+    struct bio* bio = io->bio;
 
     bio->bi_sector = security_map_hash_sector(
         s, io->offset >> (SECTOR_SHIFT - s->hash_node_bits));
@@ -272,7 +271,7 @@ void ksecurityd_hash_io(struct work_struct* work) {
     struct security_hash_io* io =
         container_of(work, struct security_hash_io, work);
 
-    if (bio_data_dir(io->base_bio) == READ) {
+    if (bio_data_dir(io->bio) == READ) {
         if (ksecurityd_hash_io_read(io, GFP_NOIO))
             io->error = -ENOMEM;
     } else
@@ -291,7 +290,120 @@ void ksecurityd_hash_write_io_submit(struct security_hash_io* io, int async) {
 }
 
 void ksecurityd_hash_write_convert(struct security_hash_io* io) {
-    // TODO
+    struct dm_security* s = io->s;
+    struct dm_security_io* base_io = io->base_io;
+    struct security_mediate_node *mn = NULL, *tmp = NULL;
+    struct security_leaf_node* ln = NULL;
+    struct list_head delta_list; /* list of mediate node hash deltas */
+    struct mediate_node_hash_delta *hash_delta = NULL, *tmp_delta;
+    struct bio* bio = io->bio;
+    struct bio_vec* bvec;
+    struct page* page;
+    struct inc_hash_ctx* ctx = NULL;
+    size_t digest_size = hash_node_size(s);
+    u8 root_delta[AUTHSIZE] = {0};
+    unsigned i, j, len, offset, ret = 0;
+
+    ctx = kmalloc(sizeof(struct inc_hash_ctx) + digest_size * 2, GFP_NOIO);
+    if (!ctx) {
+        io->error = -ENOMEM;
+        goto out;
+    }
+    ctx->old_len = digest_size;
+
+    /**
+     * Wait for leaf nodes to be fetched into cache,
+     * so that we can update mediate nodes using inc hash algo.
+     */
+    wait_for_completion(&io->restart);
+
+    j = 0;
+    bio_for_each_segment_all(bvec, bio, i) {
+        page = bvec->bv_page;
+        len = bvec->bv_len;
+        offset = bvec->bv_offset;
+        while (j < io->count && offset < len) {
+            tmp = mediate_node_of_block(s, io->offset + j);
+            if (tmp != mn) {
+                mn = tmp;
+                hash_delta =
+                    kzalloc(sizeof(struct mediate_node_hash_delta), GFP_NOIO);
+                BUG_ON(!hash_delta);
+                hash_delta->index = mn->index;
+                list_add_tail(&hash_delta->list, &delta_list);
+            }
+
+            BUG_ON(!mn->leaves);
+            ln = mn->leaves[MASK_BITS(io->offset + i, s->leaves_per_node_bits)];
+            /* defer mutex_unlock to io completion */
+            mutex_lock(&ln->lock);
+
+            ctx->id = ln->index;
+            memcpy(ctx->data, ln->digest, digest_size);
+            memcpy(ln->digest, page_address(page) + offset, digest_size);
+            memcpy(ctx->data + digest_size, ln->digest, digest_size);
+
+            crypto_shash_digest(s->hash_desc, (const u8*)ctx, digest_size,
+                                hash_delta->digest);
+
+            offset += digest_size;
+            j++;
+        }
+    }
+
+    /**
+     * Update mediate nodes using inc hash algo independent of leaf nodes,
+     * so that different leaf nodes can be updated concurrently and won't block
+     * each other.
+     */
+    list_for_each_entry_safe(hash_delta, tmp_delta, &delta_list, list) {
+        mn = s->mediate_nodes[hash_delta->index];
+        /* defer mutex_unlock to io completion */
+        mutex_lock(&mn->lock);
+
+        memcpy(ctx->data, mn->digest, digest_size);
+        crypto_xor(mn->digest, hash_delta->digest, digest_size);
+        memcpy(ctx->data + digest_size, mn->digest, digest_size);
+        ctx->id = mn->index;
+
+        crypto_shash_digest(s->hash_desc, (const u8*)ctx, digest_size,
+                            root_delta);
+    }
+
+    mutex_lock(&s->root_hash_lock);
+
+    crypto_xor(s->root_hash, root_delta, digest_size);
+    ret = trusted_storage_write(s->root_hash_key, s->root_hash, digest_size);
+    if (ret) {
+        DMERR("failed to write root hash to trusted storage");
+        goto out;
+    }
+
+    init_completion(&io->restart);
+    ksecurityd_security_write_io_submit(base_io, 0);
+    wait_for_completion(&io->restart);
+
+out:
+
+    mutex_unlock(&s->root_hash_lock);
+
+    list_for_each_entry_safe(hash_delta, tmp_delta, &delta_list, list) {
+        mn = s->mediate_nodes[hash_delta->index];
+        mutex_unlock(&mn->lock);
+        list_del(&hash_delta->list);
+        kfree(hash_delta);
+    }
+
+    for (i = 0; i < io->count; i++) {
+        mn = mediate_node_of_block(s, io->offset + i);
+        ln = mn->leaves[MASK_BITS(io->offset + i, s->leaves_per_node_bits)];
+        ln->verified = true;
+        ln->dirty = true;
+        mutex_unlock(&ln->lock);
+    }
+
+    if (ctx)
+        kfree(ctx);
 }
 
 struct security_leaf_node** security_leaves_cache_alloc(
@@ -301,7 +413,7 @@ struct security_leaf_node** security_leaves_cache_alloc(
     struct security_mediate_node* evict_mn = NULL;
     struct security_leaf_node** leaves = NULL;
     size_t leaves_per_node = 1 << s->leaves_per_node_bits;
-    size_t i;
+    size_t i, offset;
 
     mutex_lock(&mn->lock);
     if (mn->leaves)
@@ -335,10 +447,13 @@ struct security_leaf_node** security_leaves_cache_alloc(
                          GFP_NOIO);
         if (!leaves)
             goto nomem;
+
+        offset = mn->index << s->leaves_per_node_bits;
         for (i = 0; i < leaves_per_node; i++) {
             leaves[i] = kmalloc(sizeof(struct security_leaf_node), GFP_NOIO);
             if (!leaves[i])
                 goto nomem;
+            security_leaf_node_init(leaves[i], mn, offset + i);
         }
     }
 
@@ -402,6 +517,7 @@ void security_leaf_node_init(struct security_leaf_node* ln,
     ln->parent = mn;
     ln->index = index;
     ln->dirty = false;
+    ln->verified = false;
     ln->ref_count = 0;
     mutex_init(&ln->lock);
 }
@@ -477,7 +593,7 @@ void ksecurityd_hash_read_convert(struct security_hash_io* io) {
     struct dm_security* s = io->s;
     struct hash_prefetch_item* item = io->prefetch;
     struct security_hash_io* pos;
-    struct bio* bio = io->base_bio;
+    struct bio* bio = io->bio;
     struct bio_vec* bvec;
     struct page* page;
     struct security_mediate_node* mn = NULL;
@@ -487,13 +603,7 @@ void ksecurityd_hash_read_convert(struct security_hash_io* io) {
     size_t digest_size = hash_node_size(s);
     u8 digest[AUTHSIZE];
     unsigned int len, offset;
-    size_t i, j, idx, size = 0;
-
-    pr_info(
-        "ksecurityd_hash_read_convert: bio->bi_sector = %lu, bio->bi_size = "
-        "%u, "
-        "io->offset = %u, io->count = %lu\n",
-        bio->bi_sector, bio->bi_size, io->offset, io->count);
+    size_t i, j, idx;
 
     /* 1. Place leaves to cache in corresponding mediate nodes */
 
@@ -504,13 +614,14 @@ void ksecurityd_hash_read_convert(struct security_hash_io* io) {
         offset = bvec->bv_offset;
         while (i < io->count && offset < len) {
             mn = mediate_node_of_block(s, io->offset + i);
-            leaves = security_leaves_cache_alloc(mn);
-            size += digest_size;
 
-            ln = leaves[MASK_BITS(io->offset + i, s->leaves_per_node_bits)];
-            security_leaf_node_init(ln, mn, io->offset + i);
-            memcpy(ln->digest, page_address(page) + offset, digest_size);
-            security_leaves_cache_add(mn, leaves);
+            if (!mn->cached) {
+                leaves = security_leaves_cache_alloc(mn);
+                ln = leaves[MASK_BITS(io->offset + i, s->leaves_per_node_bits)];
+                memcpy(ln->digest, page_address(page) + offset, digest_size);
+                ln->verified = true;
+                security_leaves_cache_add(mn, leaves);
+            }
 
             offset += digest_size;
             i++;
@@ -519,8 +630,6 @@ void ksecurityd_hash_read_convert(struct security_hash_io* io) {
 
     /* 2. Verify leaves using corresponding mediate node if possible */
 
-    pr_info("ksecurityd_hash_read_convert: 1\n");
-
     ctx = kmalloc(sizeof(struct inc_hash_ctx) + digest_size, GFP_NOIO);
     if (!ctx) {
         io->error = -ENOMEM;
@@ -528,7 +637,6 @@ void ksecurityd_hash_read_convert(struct security_hash_io* io) {
     }
     ctx->old_len = 0;
 
-    pr_info("ksecurityd_hash_read_convert: 2\n");
     i = 0;
     while (i < io->count) {
         memset(digest, 0, digest_size);
@@ -553,14 +661,14 @@ void ksecurityd_hash_read_convert(struct security_hash_io* io) {
 
         mn->corrupted = memcmp(digest, mn->digest, digest_size) ? true : false;
         if (unlikely(mn->corrupted)) {
-            pr_info("ksecurityd_hash_read_convert: mn[%p] corrupted = %d\n", mn,
-                    mn->corrupted);
-            pr_info("digest: %.2x %.2x %.2x %.2x %.2x %.2x %.2x %.2x\n",
-                    digest[0], digest[1], digest[2], digest[3], digest[4],
-                    digest[5], digest[6], digest[7]);
-            pr_info("mn->dg: %.2x %.2x %.2x %.2x %.2x %.2x %.2x %.2x\n",
-                    mn->digest[0], mn->digest[1], mn->digest[2], mn->digest[3],
-                    mn->digest[4], mn->digest[5], mn->digest[6], mn->digest[7]);
+            DMERR("ksecurityd_hash_read_convert: mn[%p] corrupted = %d", mn,
+                  mn->corrupted);
+            DMERR("digest: %.2x %.2x %.2x %.2x %.2x %.2x %.2x %.2x\n",
+                  digest[0], digest[1], digest[2], digest[3], digest[4],
+                  digest[5], digest[6], digest[7]);
+            DMERR("mn->dg: %.2x %.2x %.2x %.2x %.2x %.2x %.2x %.2x\n",
+                  mn->digest[0], mn->digest[1], mn->digest[2], mn->digest[3],
+                  mn->digest[4], mn->digest[5], mn->digest[6], mn->digest[7]);
         }
 
         mutex_unlock(&mn->lock);
@@ -568,29 +676,22 @@ void ksecurityd_hash_read_convert(struct security_hash_io* io) {
         i += (1 << s->leaves_per_node_bits);
     }
 
-    pr_info("ksecurityd_hash_read_convert: 3\n");
-
 out:
     if (ctx)
         kfree(ctx);
 
-    pr_info("ksecurityd_hash_read_convert: 4\n");
-
     list_for_each_entry(pos, &item->wait_list, list) {
-        pr_info("ksecurityd_hash_read_convert: 5\n");
         complete(&pos->restart);
     }
-    pr_info("ksecurityd_hash_read_convert: 6\n");
 
     security_hash_io_free(io);
-    pr_info("ksecurityd_hash_read_convert: 7\n");
 }
 
 void ksecurityd_hash(struct work_struct* work) {
     struct security_hash_io* io =
         container_of(work, struct security_hash_io, work);
 
-    if (bio_data_dir(io->base_bio) == READ) {
+    if (bio_data_dir(io->bio) == READ) {
         ksecurityd_hash_read_convert(io);
     } else {
         ksecurityd_hash_write_convert(io);
@@ -617,14 +718,16 @@ int security_hash_flush(void* data) {
     DMINFO("Security hash flusher started (pid %d)", current->pid);
 
     while (1) {
-        pr_info("hash_flush wait for completion...\n");
         init_completion(&sht->wait);
         wait_for_completion_timeout(&sht->wait, HASH_FLUSH_TIMEOUT);
+
+        pr_info("security_hash_flush: 1\n");
 
         mutex_lock(&sht->queue_lock);
 
         /* Exit prefetch thread */
         if (kthread_should_stop() && list_empty(&sht->queue)) {
+            pr_info("security_hash_flush: 2\n");
             sht->stopped = true;
             mutex_unlock(&sht->queue_lock);
             ret = 0;
@@ -636,9 +739,11 @@ int security_hash_flush(void* data) {
         ln = list_first_entry_or_null(&sht->queue, struct security_leaf_node,
                                       flush_list);
         if (!ln) {
+            pr_info("security_hash_flush: 3\n");
             mutex_unlock(&sht->queue_lock);
             continue;
         }
+        pr_info("security_hash_flush: 4\n");
 
         /* 2. Walk through hash rbtree to get adjacent items */
 
@@ -647,6 +752,7 @@ int security_hash_flush(void* data) {
         start = &ln->flush_rb_node;
         end = rb_next(&ln->flush_rb_node);
         for (node = &ln->flush_rb_node; node; node = rb_prev(node)) {
+            pr_info("security_hash_flush: 5\n");
             tmp = rb_entry(node, struct security_leaf_node, flush_rb_node);
             if (tmp->index != index)
                 break;
@@ -656,6 +762,7 @@ int security_hash_flush(void* data) {
         /* Traverse right side of leaf node */
         index = ln->index;
         for (node = &ln->flush_rb_node; node; node = rb_next(node)) {
+            pr_info("security_hash_flush: 6\n");
             tmp = rb_entry(node, struct security_leaf_node, flush_rb_node);
             index = tmp->index;
             if (tmp->index != index) {
@@ -667,38 +774,48 @@ int security_hash_flush(void* data) {
 
         /* 3. Remove all adjacent items from both queue and rbtree */
 
+        pr_info("security_hash_flush: 7\n");
+
         count = index - offset;
         io = security_hash_io_alloc(s, offset, count);
         bio = bio_alloc_bioset(GFP_NOIO, count, s->bs);
         if (!bio) {
+            pr_info("security_hash_flush: 8\n");
             ret = -ENOMEM;
             mutex_unlock(&sht->queue_lock);
             goto nomem;
         }
         hash_bio_init(io, bio);
 
+        pr_info("security_hash_flush: 9\n");
         for (node = start; node != end; node = rb_next(node)) {
+            pr_info("security_hash_flush: 10\n");
             ln = rb_entry(node, struct security_leaf_node, flush_rb_node);
 
             rb_erase(node, &sht->rbtree_root);
             list_del(&ln->flush_list);
 
+            pr_info("security_hash_flush: 11\n");
             bio_add_page(bio, virt_to_page(ln->digest), sizeof(ln->digest),
                          offset_in_page(ln->digest));
         }
 
         /* 4. Go ahead process */
 
+        pr_info("security_hash_flush: 12\n");
         bio->bi_rw |= WRITE;
-        io->base_bio = bio;
+        io->bio = bio;
         ksecurityd_hash_queue_io(io);
 
+        pr_info("security_hash_flush: 13\n");
         mutex_unlock(&sht->queue_lock);
     }
 
+    pr_info("security_hash_flush: 14\n");
     ret = 0;
 
 nomem:
+    pr_info("security_hash_flush: 15\n");
     if (io)
         security_hash_io_free(io);
 out:
@@ -726,15 +843,10 @@ int security_hash_pre_prefetch(void* data) {
     DMINFO("Security hash pre-prefetcher started (pid %d)", current->pid);
 
     while (1) {
-        pr_info("hash_pre-prefetcher wait for completion...\n");
         wait_for_completion_timeout(&sht->pre_wait, HASH_PREFETCH_TIMEOUT);
         reinit_completion(&sht->pre_wait);
 
-        pr_info("hash_pre-prefetcher: 0\n");
-
         mutex_lock(&sht->pre_queue_lock);
-
-        pr_info("hash_pre-prefetcher: 1\n");
 
         /* Exit prefetch thread */
         if (kthread_should_stop() && list_empty(&sht->pre_queue)) {
@@ -743,42 +855,35 @@ int security_hash_pre_prefetch(void* data) {
             ret = 0;
             goto out;
         }
-        pr_info("hash_pre-prefetcher: 2\n");
 
         /* 1. Pop one item from queue */
 
         item = list_first_entry_or_null(&sht->pre_queue,
                                         struct hash_prefetch_item, list);
-        if (item) {
-            pr_info("hash_pre-prefetcher: 3\n");
+        if (item)
             list_del(&item->list);
-        } else {
-            pr_info("hash_pre-prefetcher: 4\n");
+        else {
             mutex_unlock(&sht->pre_queue_lock);
             continue;
         }
         mutex_unlock(&sht->pre_queue_lock);
 
         /* 2. Quickly check if already in cache */
-        pr_info("hash_pre-prefetcher: 5\n");
 
         offset = item->start;
         for (offset = item->start;
              offset < min((block_t)(item->start + item->count), s->data_blocks);
              offset += leaves_per_node) {
-            pr_info("hash_pre-prefetcher: 6\n");
             mn = mediate_node_of_block(s, offset);
             mutex_lock(&mn->lock);
             cache_hit = mn->cached;
             mutex_unlock(&mn->lock);
-            pr_info("hash_pre-prefetcher: 7\n");
             if (!cache_hit)
                 goto cache_miss;
         }
 
         /* Now all hash block in cache */
         list_for_each_entry_safe(io, next, &item->wait_list, list) {
-            pr_info("hash_pre-prefetcher: 8\n");
             list_del(&io->list);
             complete(&io->restart);
         }
@@ -788,7 +893,6 @@ int security_hash_pre_prefetch(void* data) {
         continue;
 
         /* 3. Check if already in prefetch_queue */
-        pr_info("hash_pre-prefetcher: 9\n");
 
     cache_miss:
         mutex_lock(&sht->queue_lock);
@@ -796,7 +900,6 @@ int security_hash_pre_prefetch(void* data) {
         new = &(sht->rbtree_root.rb_node);
         parent = NULL;
         while (*new) {
-            pr_info("hash_pre-prefetcher: 10\n");
             tmp = rb_entry(*new, struct hash_prefetch_item, rb_node);
             parent = *new;
             if (item->start < tmp->start) {
@@ -809,30 +912,21 @@ int security_hash_pre_prefetch(void* data) {
             }
         }
 
-        pr_info("hash_pre-prefetcher: 11\n");
         if (*new) {
             /* 4.a Merge item to existing one (tmp) */
             hash_prefetch_item_merge(tmp, item);
             kfree(item);
-            pr_info("hash_pre-prefetcher: 11.1\n");
         } else {
             /* 4.b Add to prefetch_queue directly */
             list_add_tail(&item->list, &sht->queue);
             /* Add new node and rebalance tree. */
             rb_link_node(&item->rb_node, parent, new);
             rb_insert_color(&item->rb_node, &sht->rbtree_root);
-            pr_info(
-                "hash_pre-prefetcher: 11.2, item->start = %lu, item->count = "
-                "%lu\n",
-                item->start, item->count);
         }
-
-        pr_info("hash_pre-prefetcher: 12\n");
 
         mutex_unlock(&sht->queue_lock);
 
         complete(&sht->wait);
-        pr_info("hash_pre-prefetcher: 13\n");
     }
 
     ret = 0;
@@ -853,16 +947,10 @@ int security_hash_prefetch(void* data) {
     DMINFO("Security hash prefetcher started (pid %d)", current->pid);
 
     while (1) {
-        pr_info("hash_prefetcher wait for completion...\n");
-
         wait_for_completion_timeout(&sht->wait, HASH_PREFETCH_TIMEOUT);
         reinit_completion(&sht->wait);
 
-        pr_info("hash_prefetcher: 0\n");
-
         mutex_lock(&sht->queue_lock);
-
-        pr_info("hash_prefetcher: 1\n");
 
         /* Exit prefetch thread */
         if (kthread_should_stop() && list_empty(&sht->queue) && sht->stopped) {
@@ -871,21 +959,15 @@ int security_hash_prefetch(void* data) {
             goto out;
         }
 
-        pr_info("hash_prefetcher: 2\n");
-
         /* 1. Get one item from queue */
         item = list_first_entry_or_null(&sht->queue, struct hash_prefetch_item,
                                         list);
         if (!item) {
-            pr_info("hash_prefetcher: 3\n");
             mutex_unlock(&sht->queue_lock);
             continue;
         }
 
         /* 2. Walk through hash rbtree to get adjacent items */
-
-        pr_info("hash_prefetcher: 4, item->start = %lu, item->count = %lu\n",
-                item->start, item->count);
 
         /* Traverse left side of io */
         start = &item->rb_node;
@@ -896,7 +978,6 @@ int security_hash_prefetch(void* data) {
                 break;
             start = node;
         }
-        pr_info("hash_prefetcher: 5\n");
         /* Traverse right side of io */
         for (node = &item->rb_node; node; node = rb_next(node)) {
             tmp = rb_entry(node, struct hash_prefetch_item, rb_node);
@@ -907,7 +988,6 @@ int security_hash_prefetch(void* data) {
         }
 
         /* 3. Remove all adjacent items from both queue and rbtree */
-        pr_info("hash_prefetcher: 6\n");
         merged = kmalloc(sizeof(struct hash_prefetch_item), GFP_KERNEL);
         if (unlikely(!merged)) {
             ret = -ENOMEM;
@@ -915,7 +995,6 @@ int security_hash_prefetch(void* data) {
         }
         init_hash_prefetch_item(merged, 0, 0);
 
-        pr_info("hash_prefetcher: 7\n");
         for (node = start; node != end; node = rb_next(node)) {
             tmp = rb_entry(node, struct hash_prefetch_item, rb_node);
             hash_prefetch_item_merge(merged, tmp);
@@ -926,29 +1005,16 @@ int security_hash_prefetch(void* data) {
 
         mutex_unlock(&sht->queue_lock);
 
-        pr_info(
-            "hash_prefetcher: 7.1, merged->start = %lu, merged->count = %lu\n",
-            merged->start, merged->count);
-
         /* 4. Go ahead process */
-        pr_info("hash_prefetcher: 8\n");
         io = security_hash_io_alloc(s, merged->start, merged->count);
         io->prefetch = merged;
 
-        pr_info("hash_prefetcher: 9\n");
         ret = security_hash_alloc_buffer(io);
         if (unlikely(ret))
             goto out;
 
-        pr_info(
-            "hash_prefetcher: 10, bio->bi_sector = %lu, bio->bi_size = %u, "
-            "io->offset = %u, io->count = %lu\n",
-            io->base_bio->bi_sector, io->base_bio->bi_size, io->offset,
-            io->count);
-        io->base_bio->bi_rw |= READ;
+        io->bio->bi_rw |= READ;
         ksecurityd_hash_queue_io(io);
-
-        pr_info("hash_prefetcher: 11\n");
     }
 
 out:
@@ -957,11 +1023,10 @@ out:
 }
 
 int security_hash_task_start(struct security_hash_task* sht,
+                             void* owner,
                              char* name,
                              int (*fn)(void* data),
                              int (*pre_fn)(void* data)) {
-    struct dm_security* s =
-        container_of(sht, struct dm_security, hash_prefetcher);
     int ret;
 
     if (!sht)
@@ -977,14 +1042,14 @@ int security_hash_task_start(struct security_hash_task* sht,
     mutex_init(&sht->queue_lock);
 
     if (pre_fn) {
-        sht->pre_task = kthread_run(pre_fn, sht, "dms_%s-%p", name, s);
+        sht->pre_task = kthread_run(pre_fn, sht, "dms_%s-%p", name, owner);
         if (sht->task == ERR_PTR(-ENOMEM)) {
             ret = -ENOMEM;
             goto bad;
         }
     }
 
-    sht->task = kthread_run(fn, sht, "dms_%s-%p", name, s);
+    sht->task = kthread_run(fn, sht, "dms_%s-%p", name, owner);
     if (sht->task == ERR_PTR(-ENOMEM)) {
         ret = -ENOMEM;
         goto bad;

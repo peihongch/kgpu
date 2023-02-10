@@ -19,6 +19,7 @@
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/kthread.h>
+#include <linux/ktime.h>
 #include <linux/list.h>
 #include <linux/mempool.h>
 #include <linux/module.h>
@@ -37,6 +38,7 @@
 #include <linux/device-mapper.h>
 
 #include "../crypto/inc-hash/inc-hash.h"
+#include "../trusted-storage/trusted-storage.h"
 
 #define DM_SUPER_BLOCK_MAGIC (cpu_to_be64(0x5345435552495459ULL))  // "SECURITY"
 #define DM_MSG_PREFIX "security"
@@ -52,8 +54,10 @@
 
 #define HASH_FLUSH_TIMEOUT (1 * HZ)
 #define HASH_PREFETCH_TIMEOUT (1 * HZ)
+#define CACHE_TRANSFER_TIMEOUT (1 * HZ)
 
-#define HASH_NODES_CACHE_CAPACITY (256)
+#define HASH_NODES_CACHE_CAPACITY (256)         // 256 nodes = 4MB
+#define DATA_BLOCKS_CACHE_CAPACITY (256 * 128)  // 256 * 64 blocks = 64MB
 
 typedef unsigned int block_t;
 
@@ -61,10 +65,8 @@ typedef unsigned int block_t;
  * Data structure for dm-security device super block
  */
 struct security_super_block {
-    u64 magic;         /* super block identifier - SECURITY */
-    u64 root_hash_key; /* key of root hash in trusted storage */
-    // u64 hash_area_size;      /* size of the hash area in sectors */
-    // u64 data_area_size;      /* size of the data area in sectors */
+    u64 magic;               /* super block identifier - SECURITY */
+    u64 root_hash_key;       /* key of root hash in trusted storage */
     u64 data_start;          /* data offset in 512B sectors */
     u64 hash_start;          /* hash offert in 512B sectors */
     u64 data_area_size;      /* data area size in 512B sectors */
@@ -104,8 +106,9 @@ struct security_mediate_node {
 
 /* Data structure for dm-security device hash tree leaf node */
 struct security_leaf_node {
-    size_t index; /* Index of leaf node in hash tree */
-    bool dirty;   /* Indicate if leaf nodes in cache modified */
+    size_t index;  /* Index of leaf node in hash tree */
+    bool dirty;    /* Indicate if leaf nodes in cache modified */
+    bool verified; /* Indicate if leaf nodes in cache valid */
     struct security_mediate_node* parent;
     struct list_head flush_list;  /* List of leaf nodes to be flushed */
     struct rb_node flush_rb_node; /* Red-black tree node for flush list */
@@ -116,10 +119,13 @@ struct security_leaf_node {
 
 /* Data structure for dm-security device data block */
 struct security_data_block {
-    sector_t sector;           /* Start sector number of data block */
-    struct mutex lock;         /* Lock for data block */
-    struct list_head lru_item; /* List item for LRU list */
-    void* buf;                 /* buffer for data block */
+    sector_t start;               /* Start sector number of data block */
+    struct mutex lock;            /* Lock for data block */
+    struct list_head lru_item;    /* List item for LRU list */
+    unsigned long long timestamp; /* Timestamp of creation */
+    atomic_t ref_count;           /* Reference count of data block */
+    bool dirty;                   /* Indicate if data block modified */
+    void* buf;                    /* buffer for data block */
 };
 
 struct hash_prefetch_item {
@@ -129,6 +135,25 @@ struct hash_prefetch_item {
     struct mutex lock;          /* lock for hash prefetch item */
     size_t start;               /* start index of hash blocks to prefetch */
     size_t count;               /* number of hash blocks to prefetch */
+};
+
+struct mediate_node_hash_delta {
+    struct list_head list;
+    size_t index;
+    u8 digest[AUTHSIZE];
+};
+
+struct hash_update_item {
+    struct list_head list;            /* list_head for update queue */
+    struct list_head delta_list;      /* list of mediate node hash deltas */
+    struct mutex lock;                /* lock for hash update item */
+    struct security_hash_io* base_io; /* base hash io for update */
+};
+
+struct cache_transfer_item {
+    struct list_head list;        /* list_head for transfer queue */
+    struct dm_security_io* io;    /* io to transfer */
+    unsigned long long timestamp; /* creation timestamp of transfer item */
 };
 
 /*
@@ -178,7 +203,7 @@ struct security_super_block_io {
  */
 struct security_hash_io {
     struct dm_security* s;
-    struct bio* base_bio;
+    struct bio* bio;
     struct work_struct work;
     struct list_head list;
     struct hash_prefetch_item* prefetch;
@@ -188,7 +213,7 @@ struct security_hash_io {
     size_t offset; /* leaf node index of hash tree */
     size_t count;  /* number of leaf nodes to read/write */
     struct completion restart;
-    struct security_hash_io* base_io;
+    struct dm_security_io* base_io;
 };
 
 /*
@@ -237,6 +262,14 @@ struct security_hash_task {
     bool stopped;
 };
 
+struct security_cache_task {
+    struct task_struct* task;
+    struct completion wait;
+    struct list_head queue;
+    struct mutex queue_lock;
+    bool stopped;
+};
+
 struct hash_nodes_cache {
     struct mutex lock;         /* lock for hash nodes cache */
     struct list_head lru_list; /* LRU list for hash nodes */
@@ -245,10 +278,12 @@ struct hash_nodes_cache {
 };
 
 struct data_blocks_cache {
-    struct mutex lock;              /* lock for data blocks cache */
+    struct mutex rt_lock;           /* lock for radix tree */
+    struct mutex lru_lock;          /* lock for lru list */
     struct radix_tree_root rt_root; /* radix tree cache for data blocks */
     struct list_head lru_list;      /* LRU list for data blocks */
     size_t size;                    /* number of data blocks in cache */
+    size_t capacity;                /* capacity of data blocks cache */
 };
 
 /*
@@ -260,10 +295,14 @@ struct dm_security {
     struct dm_target* ti;
     sector_t start;
 
+    struct mutex root_hash_lock; /* lock for root hash */
+    u8 root_hash[AUTHSIZE];      /* root hash of hash tree */
+
     struct security_super_block* sb;
     struct security_mediate_node** mediate_nodes;
     struct security_hash_task hash_flusher;
     struct security_hash_task hash_prefetcher;
+    struct security_cache_task cache_transferer;
     struct hash_nodes_cache hash_nodes_cache;
     struct data_blocks_cache data_blocks_cache;
 
@@ -343,6 +382,12 @@ struct dm_security {
     u8 key[0];
 };
 
+struct security_iv_operations {
+    int (*generator)(struct dm_security* s,
+                     u8* iv,
+                     struct dm_security_request* dmreq);
+};
+
 #define init_hash_nodes_cache(cache)                   \
     do {                                               \
         mutex_init(&(cache)->lock);                    \
@@ -351,12 +396,14 @@ struct dm_security {
         (cache)->capacity = HASH_NODES_CACHE_CAPACITY; \
     } while (0)
 
-#define init_data_blocks_cache(cache, mask)         \
-    do {                                            \
-        mutex_init(&(cache)->lock);                 \
-        INIT_RADIX_TREE(&(cache)->rt_root, (mask)); \
-        INIT_LIST_HEAD(&(cache)->lru_list);         \
-        (cache)->size = 0;                          \
+#define init_data_blocks_cache(cache, mask)             \
+    do {                                                \
+        mutex_init(&(cache)->rt_lock);                  \
+        mutex_init(&(cache)->lru_lock);                  \
+        INIT_RADIX_TREE(&(cache)->rt_root, (mask));     \
+        INIT_LIST_HEAD(&(cache)->lru_list);             \
+        (cache)->size = 0;                              \
+        (cache)->capacity = DATA_BLOCKS_CACHE_CAPACITY; \
     } while (0)
 
 #define init_hash_prefetch_item(item, s, c) \
@@ -437,7 +484,9 @@ void ksecurityd_queue_hash(struct security_hash_io* io);
 int security_hash_flush(void* data);
 int security_hash_pre_prefetch(void* data);
 int security_hash_prefetch(void* data);
+int security_hash_update(void* data);
 int security_hash_task_start(struct security_hash_task* sht,
+                             void* owner,
                              char* name,
                              int (*fn)(void* data),
                              int (*pre_fn)(void* data));
@@ -445,6 +494,37 @@ void security_hash_task_stop(struct security_hash_task* sht);
 
 /* dm-security data blocks cache related operations */
 
-int security_cache_lookup(struct data_blocks_cache* cache, struct bio* bio);
+struct security_data_block* security_data_block_alloc(struct dm_security* s,
+                                                      sector_t sector,
+                                                      unsigned long long ts);
+void security_data_block_free(struct security_data_block* data_block);
+int security_cache_lookup(struct dm_security* s, struct dm_security_io* io);
+int security_cache_evict(struct dm_security* s, block_t blocks);
+int security_cache_insert(struct dm_security* s,
+                          struct dm_security_io* io,
+                          unsigned long long ts);
+void security_queue_cache(struct dm_security_io* io);
+int security_cache_transfer(void* data);
+int security_cache_task_start(struct security_cache_task* sht,
+                              void* owner,
+                              char* name,
+                              int (*fn)(void* data));
+void security_cache_task_stop(struct security_cache_task* sht);
+
+/* dm-security convertion logic related operations */
+void security_convert_init(struct dm_security* s,
+                           struct convert_context* ctx,
+                           struct bio* bio_out,
+                           struct bio* bio_in,
+                           struct bio* bio_tag,
+                           sector_t sector);
+int security_convert(struct dm_security* s, struct convert_context* ctx);
+struct dm_security_io* security_io_alloc(struct dm_security* s,
+                                         struct bio* bio,
+                                         sector_t sector);
+int ksecurityd_io_read(struct dm_security_io* io, gfp_t gfp);
+void ksecurityd_queue_io(struct dm_security_io* io);
+void ksecurityd_queue_security(struct dm_security_io* io);
+void ksecurityd_security_write_io_submit(struct dm_security_io* io, int async);
 
 #endif /* DM_SECURITY_H */
