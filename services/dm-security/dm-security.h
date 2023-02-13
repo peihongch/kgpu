@@ -21,6 +21,7 @@
 #include <linux/kthread.h>
 #include <linux/ktime.h>
 #include <linux/list.h>
+#include <linux/rculist.h>
 #include <linux/mempool.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -113,7 +114,7 @@ struct security_leaf_node {
     struct list_head flush_list;  /* List of leaf nodes to be flushed */
     struct rb_node flush_rb_node; /* Red-black tree node for flush list */
     struct mutex lock;
-    unsigned int ref_count;
+    atomic_t ref_count; /* Reference count of leaf node */
     u8 digest[AUTHSIZE];
 };
 
@@ -399,7 +400,7 @@ struct security_iv_operations {
 #define init_data_blocks_cache(cache, mask)             \
     do {                                                \
         mutex_init(&(cache)->rt_lock);                  \
-        mutex_init(&(cache)->lru_lock);                  \
+        mutex_init(&(cache)->lru_lock);                 \
         INIT_RADIX_TREE(&(cache)->rt_root, (mask));     \
         INIT_LIST_HEAD(&(cache)->lru_list);             \
         (cache)->size = 0;                              \

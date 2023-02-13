@@ -63,38 +63,28 @@ int security_cache_lookup(struct dm_security* s, struct dm_security_io* io) {
     size_t bs = 1 << s->data_block_bits;
     unsigned i, idx, offset, len, ret = 0;
 
-    mutex_lock(&cache->rt_lock);
+    rcu_read_lock();
 
-    if (!cache->size) {
+    /* Firstly, check if all data blocks in cache */
+    idx = offset = 0;
+    radix_tree_for_each_slot(slot, &cache->rt_root, &iter, start) {
+        block = *slot;
+        if ((block->start != cur) || (block->start >= start + sectors))
+            break;
+        cur += step;
+    }
+
+    if (cur != start + sectors) {
         ret = -EIO;
         goto out;
     }
 
+    /* Copy cached data to bio if all data blocks exist */
     idx = offset = 0;
     radix_tree_for_each_slot(slot, &cache->rt_root, &iter, start) {
         block = *slot;
-        if (!block)
-            continue;
-
-        security_data_block_inc_ref(block);
-        mutex_lock(&block->lock);
-
-        if (block->start >= start + sectors) {
-            mutex_unlock(&block->lock);
-            security_data_block_dec_ref(block);
+        if (block->start >= start + sectors)
             break;
-        }
-        if (block->start < start) {
-            mutex_unlock(&block->lock);
-            security_data_block_dec_ref(block);
-            continue;
-        }
-        if (block->start != cur) {
-            mutex_unlock(&block->lock);
-            security_data_block_dec_ref(block);
-            ret = -EIO;
-            break;
-        }
 
         /* update lru cache */
         mutex_lock(&cache->lru_lock);
@@ -115,15 +105,10 @@ int security_cache_lookup(struct dm_security* s, struct dm_security_io* io) {
                 idx++;
             }
         }
-
-        mutex_unlock(&block->lock);
-        security_data_block_dec_ref(block);
-
-        cur += step;
     }
 
 out:
-    mutex_unlock(&cache->rt_lock);
+    rcu_read_unlock();
 
     return ret;
 }

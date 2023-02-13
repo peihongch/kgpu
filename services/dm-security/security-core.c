@@ -587,7 +587,7 @@ static int security_ctr_layout(struct dm_target* ti,
     unsigned int hash_block_size = DEFAULT_DM_HASH_BLOCK_SIZE;
     unsigned int leave_per_node = DEFAULT_LEAVES_PER_NODE;
     unsigned int digestsize = AUTHSIZE;
-    u8 *saved_root_hash = NULL;
+    u8* saved_root_hash = NULL;
     int ret = -EINVAL;
     char dummy;
 
@@ -1041,7 +1041,6 @@ static int security_map(struct dm_target* ti, struct bio* bio) {
         }
     } else {
         pr_info("security_map: 7\n");
-        // ksecurityd_queue_security(io);
         security_queue_cache(io);
     }
 
