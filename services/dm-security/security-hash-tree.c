@@ -614,14 +614,11 @@ void ksecurityd_hash_read_convert(struct security_hash_io* io) {
         offset = bvec->bv_offset;
         while (i < io->count && offset < len) {
             mn = mediate_node_of_block(s, io->offset + i);
-
-            if (!mn->cached) {
-                leaves = security_leaves_cache_alloc(mn);
-                ln = leaves[MASK_BITS(io->offset + i, s->leaves_per_node_bits)];
-                memcpy(ln->digest, page_address(page) + offset, digest_size);
-                ln->verified = true;
-                security_leaves_cache_add(mn, leaves);
-            }
+            leaves = security_leaves_cache_alloc(mn);
+            ln = leaves[MASK_BITS(io->offset + i, s->leaves_per_node_bits)];
+            memcpy(ln->digest, page_address(page) + offset, digest_size);
+            ln->verified = true;
+            security_leaves_cache_add(mn, leaves);
 
             offset += digest_size;
             i++;
