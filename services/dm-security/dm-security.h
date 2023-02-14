@@ -460,7 +460,7 @@ inline struct security_mediate_node* security_get_mediate_node(
     struct dm_security* s,
     sector_t sector);
 struct security_leaf_node* security_get_leaf_node(struct dm_security* s,
-                                               size_t index);
+                                                  size_t index);
 int security_prefetch_hash_leaves(struct security_hash_io* io);
 int security_hash_alloc_buffer(struct security_hash_io* io);
 void security_hash_io_free(struct security_hash_io* io);
@@ -475,6 +475,8 @@ struct security_hash_io* security_hash_io_split(struct security_hash_io* io,
                                                 bool discard);
 int security_mediate_nodes_init(struct dm_security* s);
 void security_mediate_nodes_free(struct dm_security* s);
+void security_leaf_node_inc_ref(struct security_leaf_node* ln);
+void security_leaf_node_dec_ref(struct security_leaf_node* ln);
 void security_leaf_node_init(struct security_leaf_node* ln,
                              struct security_mediate_node* mn,
                              size_t index);
