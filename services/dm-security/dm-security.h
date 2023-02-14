@@ -21,13 +21,13 @@
 #include <linux/kthread.h>
 #include <linux/ktime.h>
 #include <linux/list.h>
-#include <linux/rculist.h>
 #include <linux/mempool.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/percpu.h>
 #include <linux/radix-tree.h>
 #include <linux/rbtree.h>
+#include <linux/rculist.h>
 #include <linux/rtnetlink.h> /* for struct rtattr and RTA macros only */
 #include <linux/rwsem.h>
 #include <linux/scatterlist.h>
@@ -107,9 +107,10 @@ struct security_mediate_node {
 
 /* Data structure for dm-security device hash tree leaf node */
 struct security_leaf_node {
-    size_t index;  /* Index of leaf node in hash tree */
-    bool dirty;    /* Indicate if leaf nodes in cache modified */
-    bool verified; /* Indicate if leaf nodes in cache valid */
+    size_t index;   /* Index of leaf node in hash tree */
+    bool dirty;     /* Indicate if leaf nodes in cache modified */
+    bool verified;  /* Indicate if leaf nodes in cache verified */
+    bool corrupted; /* Indicate if leaf nodes in cache passed verification */
     struct security_mediate_node* parent;
     struct list_head flush_list;  /* List of leaf nodes to be flushed */
     struct rb_node flush_rb_node; /* Red-black tree node for flush list */
@@ -481,6 +482,9 @@ void security_leaf_node_free(struct security_leaf_node* ln);
 void security_leaf_node_cache(struct security_leaf_node* ln);
 void security_leaf_node_update(struct security_leaf_node* ln,
                                struct security_hash_io* io);
+void security_leaves_cache_clean(struct security_mediate_node* mn);
+void security_leaves_cache_add(struct security_mediate_node* mn,
+                               struct security_leaf_node** leaves);
 void ksecurityd_queue_hash(struct security_hash_io* io);
 int security_hash_flush(void* data);
 int security_hash_pre_prefetch(void* data);

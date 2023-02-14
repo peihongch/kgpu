@@ -2,12 +2,143 @@
 #include "../crypto/inc-hash/inc-hash.h"
 #include "dm-security.h"
 
+void security_leaf_node_inc_ref(struct security_leaf_node* ln) {
+    atomic_inc(&ln->ref_count);
+}
+
+void security_leaf_node_dec_ref(struct security_leaf_node* ln) {
+    if (atomic_dec_and_test(&ln->ref_count))
+        security_leaf_node_free(ln);
+}
+
+void security_leaf_node_init(struct security_leaf_node* ln,
+                             struct security_mediate_node* mn,
+                             size_t index) {
+    ln->parent = mn;
+    ln->index = index;
+    ln->dirty = false;
+    ln->verified = false;
+    ln->corrupted = false;
+    atomic_set(&ln->ref_count, 1);
+    mutex_init(&ln->lock);
+}
+
+void security_leaf_node_free(struct security_leaf_node* ln) {
+    struct security_mediate_node* mn;
+    struct dm_security* s;
+
+    if (!ln || !(mn = ln->parent) || !(s = mn->s))
+        return;
+
+    mempool_free(ln, s->leaf_node_pool);
+}
+
+void security_mediate_node_init(struct security_mediate_node* mn) {
+    mn->dirty = 0;
+    mn->corrupted = false;
+    mn->cached = false;
+    mutex_init(&mn->lock);
+    mn->leaves = NULL;
+    memset(mn->digest, 0, sizeof(mn->digest));
+}
+
+int security_mediate_nodes_init(struct dm_security* s) {
+    struct security_mediate_node* mn;
+    int i, ret;
+
+    ret = -ENOMEM;
+    s->mediate_nodes =
+        vmalloc(sizeof(struct security_mediate_node*) * s->hash_mediate_nodes);
+    if (!s->mediate_nodes)
+        goto bad;
+
+    for (i = 0; i < s->hash_mediate_nodes; i++) {
+        s->mediate_nodes[i] =
+            kmalloc(sizeof(struct security_mediate_node), GFP_KERNEL);
+        if (!s->mediate_nodes[i])
+            goto bad;
+
+        mn = s->mediate_nodes[i];
+        mn->index = i;
+        mn->s = s;
+        security_mediate_node_init(mn);
+    }
+
+    ret = 0;
+bad:
+    return ret;
+}
+
+void security_mediate_node_free(struct security_mediate_node* mn) {
+    if (!mn || !mn->leaves)
+        return;
+    security_leaves_cache_clean(mn);
+    kfree(mn);
+}
+
+void security_mediate_nodes_free(struct dm_security* s) {
+    int i;
+
+    if (!s->mediate_nodes)
+        return;
+
+    for (i = 0; i < s->hash_mediate_nodes; i++) {
+        security_mediate_node_free(s->mediate_nodes[i]);
+    }
+    vfree(s->mediate_nodes);
+    s->mediate_nodes = NULL;
+}
+
 inline struct security_mediate_node* security_get_mediate_node(
     struct dm_security* s,
     sector_t sector) {
     return sector >= data_area_sectors(s)
                ? NULL
                : mediate_node_of_block(s, data_block_of_sector(s, sector));
+}
+
+struct security_leaf_node* security_get_leaf_node(struct dm_security* s,
+                                                  size_t index) {
+    struct security_mediate_node* mn = NULL;
+    struct security_leaf_node *ln = NULL, **leaves = NULL;
+    size_t leaves_per_node = 1 << s->leaves_per_node_bits;
+    size_t offset, i;
+
+    if (index >= s->hash_leaf_nodes)
+        return NULL;
+
+    mn = mediate_node_of_block(s, index);
+    rcu_read_lock();
+    offset = mn->index << s->leaves_per_node_bits;
+    leaves = rcu_dereference(mn->leaves);
+    if (leaves) {
+        ln = leaves[MASK_BITS(index, s->leaves_per_node_bits)];
+        /* protect leaf node from being reclaimed */
+        security_leaf_node_inc_ref(ln);
+        rcu_read_unlock();
+        goto out;
+    }
+    rcu_read_unlock();
+
+    leaves = kmalloc(sizeof(struct security_leaf_node*) * s->hash_leaf_nodes,
+                     GFP_NOIO);
+    if (!leaves)
+        return NULL;
+    for (i = 0; i < leaves_per_node; i++) {
+        leaves[i] = kmalloc(sizeof(struct security_leaf_node), GFP_NOIO);
+        if (!leaves[i])
+            goto out;
+        security_leaf_node_init(leaves[i], mn, offset + i);
+    }
+
+    security_leaves_cache_add(mn, leaves);
+
+    ln = leaves[MASK_BITS(index, s->leaves_per_node_bits)];
+    /* protect leaf node from being reclaimed */
+    security_leaf_node_inc_ref(ln);
+
+out:
+    return ln;
 }
 
 struct security_leaf_node* cache_get_leaf_node(struct dm_security* s,
@@ -406,6 +537,17 @@ out:
         kfree(ctx);
 }
 
+bool security_leaves_cache_is_empty(struct dm_security* s) {
+    struct hash_nodes_cache* cache = &s->hash_nodes_cache;
+    bool empty = false;
+
+    rcu_read_lock();
+    empty = list_empty(&cache->lru_list);
+    rcu_read_unlock();
+
+    return empty;
+}
+
 struct security_leaf_node** security_leaves_cache_alloc(
     struct security_mediate_node* mn) {
     struct dm_security* s = mn->s;
@@ -415,10 +557,10 @@ struct security_leaf_node** security_leaves_cache_alloc(
     size_t leaves_per_node = 1 << s->leaves_per_node_bits;
     size_t i, offset;
 
-    mutex_lock(&mn->lock);
+    rcu_read_lock();
     if (mn->leaves)
         leaves = mn->leaves;
-    mutex_unlock(&mn->lock);
+    rcu_read_unlock();
 
     if (leaves)
         goto out;
@@ -478,23 +620,20 @@ void security_leaves_cache_add(struct security_mediate_node* mn,
     struct hash_nodes_cache* cache = &s->hash_nodes_cache;
 
     mutex_lock(&mn->lock);
-
-    mn->leaves = leaves;
+    rcu_assign_pointer(mn->leaves, leaves);
+    synchronize_rcu();
+    mutex_unlock(&mn->lock);
 
     mutex_lock(&cache->lock);
 
-    /* del before add to avoid "list_add double add: xxx" bug */
-    if (mn->cached)
-        list_del(&mn->lru_item);
-    else {
-        mn->cached = true;
-        cache->size++;
-    }
-    list_add_tail(&mn->lru_item, &cache->lru_list);
+    mutex_lock(&mn->lock);
+    list_add_tail_rcu(&mn->lru_item, &cache->lru_list);
+    synchronize_rcu();
+    mutex_unlock(&mn->lock);
+
+    cache->size++;
 
     mutex_unlock(&cache->lock);
-
-    mutex_unlock(&mn->lock);
 }
 
 void security_leaves_cache_clean(struct security_mediate_node* mn) {
@@ -511,92 +650,6 @@ void security_leaves_cache_clean(struct security_mediate_node* mn) {
     mn->leaves = NULL;
 }
 
-void security_leaf_node_inc_ref(struct security_leaf_node* ln) {
-    atomic_inc(&ln->ref_count);
-}
-
-void security_leaf_node_dec_ref(struct security_leaf_node* ln) {
-    if (atomic_dec_and_test(&ln->ref_count))
-        security_leaf_node_free(ln);
-}
-
-void security_leaf_node_init(struct security_leaf_node* ln,
-                             struct security_mediate_node* mn,
-                             size_t index) {
-    ln->parent = mn;
-    ln->index = index;
-    ln->dirty = false;
-    ln->verified = false;
-    atomic_set(&ln->ref_count, 1);
-    mutex_init(&ln->lock);
-}
-
-void security_leaf_node_free(struct security_leaf_node* ln) {
-    struct security_mediate_node* mn;
-    struct dm_security* s;
-
-    if (!ln || !(mn = ln->parent) || !(s = mn->s))
-        return;
-
-    mempool_free(ln, s->leaf_node_pool);
-}
-
-void security_mediate_node_init(struct security_mediate_node* mn) {
-    mn->dirty = 0;
-    mn->corrupted = false;
-    mn->cached = false;
-    mutex_init(&mn->lock);
-    mn->leaves = NULL;
-    memset(mn->digest, 0, sizeof(mn->digest));
-}
-
-int security_mediate_nodes_init(struct dm_security* s) {
-    struct security_mediate_node* mn;
-    int i, ret;
-
-    ret = -ENOMEM;
-    s->mediate_nodes =
-        vmalloc(sizeof(struct security_mediate_node*) * s->hash_mediate_nodes);
-    if (!s->mediate_nodes)
-        goto bad;
-
-    for (i = 0; i < s->hash_mediate_nodes; i++) {
-        s->mediate_nodes[i] =
-            kmalloc(sizeof(struct security_mediate_node), GFP_KERNEL);
-        if (!s->mediate_nodes[i])
-            goto bad;
-
-        mn = s->mediate_nodes[i];
-        mn->index = i;
-        mn->s = s;
-        security_mediate_node_init(mn);
-    }
-
-    ret = 0;
-bad:
-    return ret;
-}
-
-void security_mediate_node_free(struct security_mediate_node* mn) {
-    if (!mn || !mn->leaves)
-        return;
-    security_leaves_cache_clean(mn);
-    kfree(mn);
-}
-
-void security_mediate_nodes_free(struct dm_security* s) {
-    int i;
-
-    if (!s->mediate_nodes)
-        return;
-
-    for (i = 0; i < s->hash_mediate_nodes; i++) {
-        security_mediate_node_free(s->mediate_nodes[i]);
-    }
-    vfree(s->mediate_nodes);
-    s->mediate_nodes = NULL;
-}
-
 /* verify leaves using in-mem mediate node */
 void ksecurityd_hash_read_convert(struct security_hash_io* io) {
     struct dm_security* s = io->s;
@@ -610,8 +663,10 @@ void ksecurityd_hash_read_convert(struct security_hash_io* io) {
     struct security_leaf_node** leaves;
     struct inc_hash_ctx* ctx = NULL;
     size_t digest_size = hash_node_size(s);
+    size_t leaves_per_node = 1 << s->leaves_per_node_bits;
     u8 digest[AUTHSIZE];
-    unsigned int len, offset;
+    unsigned len, offset;
+    unsigned corrupted;
     size_t i, j, idx;
 
     /* 1. Place leaves to cache in corresponding mediate nodes */
@@ -622,12 +677,13 @@ void ksecurityd_hash_read_convert(struct security_hash_io* io) {
         len = bvec->bv_len;
         offset = bvec->bv_offset;
         while (i < io->count && offset < len) {
-            mn = mediate_node_of_block(s, io->offset + i);
-            leaves = security_leaves_cache_alloc(mn);
-            ln = leaves[MASK_BITS(io->offset + i, s->leaves_per_node_bits)];
+            ln = security_get_leaf_node(s, io->offset + i);
+
+            mutex_lock(&ln->lock);
             memcpy(ln->digest, page_address(page) + offset, digest_size);
-            ln->verified = true;
-            security_leaves_cache_add(mn, leaves);
+            ln->verified = false;
+            ln->dirty = true;
+            mutex_unlock(&ln->lock);
 
             offset += digest_size;
             i++;
@@ -649,26 +705,26 @@ void ksecurityd_hash_read_convert(struct security_hash_io* io) {
 
         mn = mediate_node_of_block(s, io->offset + i);
 
-        mutex_lock(&mn->lock);
-
-        for (j = 0; j < (1 << s->leaves_per_node_bits); j++) {
-            ln = mn->leaves[j];
+        for (j = 0; j < leaves_per_node; j++) {
+            rcu_read_lock();
+            leaves = rcu_dereference(mn->leaves);
+            rcu_read_lock();
+            ln = leaves[j];
 
             mutex_lock(&ln->lock);
-
             /* Verify the hash value of leaf node */
             ctx->id = ln->index;
             memcpy(ctx->data, ln->digest, sizeof(ln->digest));
             crypto_shash_digest(s->hash_desc, (const u8*)ctx, digest_size,
                                 digest);
-
             mutex_unlock(&ln->lock);
         }
 
-        mn->corrupted = memcmp(digest, mn->digest, digest_size) ? true : false;
-        if (unlikely(mn->corrupted)) {
+        mutex_lock(&mn->lock);
+        corrupted = memcmp(digest, mn->digest, digest_size) ? true : false;
+        if (unlikely(corrupted)) {
             DMERR("ksecurityd_hash_read_convert: mn[%p] corrupted = %d", mn,
-                  mn->corrupted);
+                  corrupted);
             DMERR("digest: %.2x %.2x %.2x %.2x %.2x %.2x %.2x %.2x\n",
                   digest[0], digest[1], digest[2], digest[3], digest[4],
                   digest[5], digest[6], digest[7]);
@@ -676,10 +732,21 @@ void ksecurityd_hash_read_convert(struct security_hash_io* io) {
                   mn->digest[0], mn->digest[1], mn->digest[2], mn->digest[3],
                   mn->digest[4], mn->digest[5], mn->digest[6], mn->digest[7]);
         }
-
         mutex_unlock(&mn->lock);
 
-        i += (1 << s->leaves_per_node_bits);
+        for (j = 0; j < leaves_per_node; j++) {
+            rcu_read_lock();
+            leaves = rcu_dereference(mn->leaves);
+            rcu_read_lock();
+            ln = leaves[j];
+
+            mutex_lock(&ln->lock);
+            ln->verified = true;
+            ln->corrupted = corrupted;
+            mutex_unlock(&ln->lock);
+        }
+
+        i += leaves_per_node;
     }
 
 out:
