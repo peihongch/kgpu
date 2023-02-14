@@ -99,6 +99,26 @@ inline struct security_mediate_node* security_get_mediate_node(
 
 struct security_leaf_node* security_get_leaf_node(struct dm_security* s,
                                                   size_t index) {
+    struct security_mediate_node* mn;
+    struct security_leaf_node *ln = NULL, **leaves = NULL;
+
+    if (index >= s->hash_leaf_nodes)
+        return NULL;
+
+    mn = mediate_node_of_block(s, index);
+
+    rcu_read_lock();
+    leaves = rcu_dereference(mn->leaves);
+    rcu_read_unlock();
+    if (leaves)
+        ln = leaves[MASK_BITS(index, s->leaves_per_node_bits)];
+
+    return ln;
+}
+
+struct security_leaf_node* security_get_or_alloc_leaf_node(
+    struct dm_security* s,
+    size_t index) {
     struct security_mediate_node* mn = NULL;
     struct security_leaf_node *ln = NULL, **leaves = NULL;
     size_t leaves_per_node = 1 << s->leaves_per_node_bits;
@@ -107,23 +127,21 @@ struct security_leaf_node* security_get_leaf_node(struct dm_security* s,
     if (index >= s->hash_leaf_nodes)
         return NULL;
 
-    mn = mediate_node_of_block(s, index);
-    rcu_read_lock();
-    offset = mn->index << s->leaves_per_node_bits;
-    leaves = rcu_dereference(mn->leaves);
-    if (leaves) {
-        ln = leaves[MASK_BITS(index, s->leaves_per_node_bits)];
-        /* protect leaf node from being reclaimed */
-        security_leaf_node_inc_ref(ln);
-        rcu_read_unlock();
+
+    ln = security_get_leaf_node(s, index);
+    if (ln)
         goto out;
-    }
-    rcu_read_unlock();
 
     leaves = kmalloc(sizeof(struct security_leaf_node*) * s->hash_leaf_nodes,
                      GFP_NOIO);
     if (!leaves)
-        return NULL;
+        goto out;
+
+    mn = mediate_node_of_block(s, index);
+    mutex_lock(&mn->lock);
+    offset = mn->index << s->leaves_per_node_bits;
+    mutex_unlock(&mn->lock);
+
     for (i = 0; i < leaves_per_node; i++) {
         leaves[i] = kmalloc(sizeof(struct security_leaf_node), GFP_NOIO);
         if (!leaves[i])
@@ -134,26 +152,9 @@ struct security_leaf_node* security_get_leaf_node(struct dm_security* s,
     security_leaves_cache_add(mn, leaves);
 
     ln = leaves[MASK_BITS(index, s->leaves_per_node_bits)];
-    /* protect leaf node from being reclaimed */
-    security_leaf_node_inc_ref(ln);
 
 out:
     return ln;
-}
-
-struct security_leaf_node* cache_get_leaf_node(struct dm_security* s,
-                                               size_t index) {
-    struct security_mediate_node* mn;
-
-    if (index >= s->hash_leaf_nodes)
-        return NULL;
-
-    mn = mediate_node_of_block(s, index);
-    /* check if leaf node in cache */
-    if (!mn->leaves)
-        return NULL;
-
-    return leaf_node_of_block(s, index);
 }
 
 /**
@@ -677,7 +678,7 @@ void ksecurityd_hash_read_convert(struct security_hash_io* io) {
         len = bvec->bv_len;
         offset = bvec->bv_offset;
         while (i < io->count && offset < len) {
-            ln = security_get_leaf_node(s, io->offset + i);
+            ln = security_get_or_alloc_leaf_node(s, io->offset + i);
 
             mutex_lock(&ln->lock);
             memcpy(ln->digest, page_address(page) + offset, digest_size);

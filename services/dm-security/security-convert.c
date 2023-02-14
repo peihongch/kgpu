@@ -618,7 +618,7 @@ void ksecurityd_security_read_convert(struct dm_security_io* io) {
     struct security_leaf_node* ln = NULL;
     unsigned int idx_tag, offset_tag;
     unsigned int tag_size = hash_node_size(s);
-    u8 *tag_addr = NULL, *hash_addr = NULL;
+    u8* tag_addr = NULL;
     int r = 0, i;
 
     security_inc_pending(io);
@@ -640,14 +640,14 @@ void ksecurityd_security_read_convert(struct dm_security_io* io) {
         tag_addr =
             page_address(bv_tag->bv_page) + bv_tag->bv_offset + offset_tag;
 
-        ln = cache_get_leaf_node(s, i + hash_io->offset);
+        ln = security_get_leaf_node(s, i + hash_io->offset);
 
-        if (ln)
-            hash_addr = ln->digest;
-        else
-            continue;
+        mutex_lock(&ln->lock);
+        security_leaf_node_inc_ref(ln);
 
-        if (memcmp(tag_addr, hash_addr, tag_size)) {
+        BUG_ON(!ln || !ln->verified);
+        if (ln->corrupted || memcmp(tag_addr, ln->digest, tag_size)) {
+            u8* hash_addr = ln->digest;
             DMERR(
                 "tag mismatch at sector %lu, i = %d, expect {%.2x %.2x %.2x "
                 "%.2x %.2x %.2x %.2x %.2x}, actual {%.2x %.2x %.2x %.2x %.2x "
@@ -657,9 +657,14 @@ void ksecurityd_security_read_convert(struct dm_security_io* io) {
                 hash_addr[4], hash_addr[5], hash_addr[6], hash_addr[7],
                 tag_addr[0], tag_addr[1], tag_addr[2], tag_addr[3], tag_addr[4],
                 tag_addr[5], tag_addr[6], tag_addr[7]);
+            mutex_unlock(&ln->lock);
             io->error = -EBADMSG;
             goto out;
         }
+
+        /* enable leaf node to be reclaimed */
+        security_leaf_node_dec_ref(ln);
+        mutex_unlock(&ln->lock);
 
         offset_tag += tag_size;
         if (offset_tag >= bv_tag->bv_len) {

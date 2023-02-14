@@ -459,7 +459,7 @@ void ksecurityd_super_block_io_write(struct security_super_block_io* io);
 inline struct security_mediate_node* security_get_mediate_node(
     struct dm_security* s,
     sector_t sector);
-struct security_leaf_node* cache_get_leaf_node(struct dm_security* s,
+struct security_leaf_node* security_get_leaf_node(struct dm_security* s,
                                                size_t index);
 int security_prefetch_hash_leaves(struct security_hash_io* io);
 int security_hash_alloc_buffer(struct security_hash_io* io);
