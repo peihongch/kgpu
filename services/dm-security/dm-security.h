@@ -19,7 +19,7 @@
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/kthread.h>
-#include <linux/ktime.h>
+
 #include <linux/list.h>
 #include <linux/mempool.h>
 #include <linux/module.h>
@@ -121,13 +121,12 @@ struct security_leaf_node {
 
 /* Data structure for dm-security device data block */
 struct security_data_block {
-    sector_t start;               /* Start sector number of data block */
-    struct mutex lock;            /* Lock for data block */
-    struct list_head lru_item;    /* List item for LRU list */
-    unsigned long long timestamp; /* Timestamp of creation */
-    atomic_t ref_count;           /* Reference count of data block */
-    bool dirty;                   /* Indicate if data block modified */
-    void* buf;                    /* buffer for data block */
+    sector_t start;            /* Start sector number of data block */
+    struct mutex lock;         /* Lock for data block */
+    struct list_head lru_item; /* List item for LRU list */
+    atomic_t ref_count;        /* Reference count of data block */
+    bool dirty;                /* Indicate if data block modified */
+    void* buf;                 /* buffer for data block */
 };
 
 struct hash_prefetch_item {
@@ -153,10 +152,9 @@ struct hash_update_item {
 };
 
 struct cache_transfer_item {
-    struct list_head list;        /* list_head for transfer queue */
-    struct dm_security_io* io;    /* io to transfer */
-    struct mutex lock;            /* lock for cache transfer item */
-    unsigned long long timestamp; /* creation timestamp of transfer item */
+    struct list_head list;     /* list_head for transfer queue */
+    struct dm_security_io* io; /* io to transfer */
+    struct mutex lock;         /* lock for cache transfer item */
 };
 
 /*
@@ -460,6 +458,7 @@ inline struct security_mediate_node* security_get_mediate_node(
     sector_t sector);
 struct security_leaf_node* security_get_leaf_node(struct dm_security* s,
                                                   size_t index);
+void security_put_leaf_node(struct security_leaf_node* ln);
 int security_prefetch_hash_leaves(struct security_hash_io* io);
 int security_hash_alloc_buffer(struct security_hash_io* io);
 void security_hash_io_free(struct security_hash_io* io);
@@ -501,14 +500,13 @@ void security_hash_task_stop(struct security_hash_task* sht);
 /* dm-security data blocks cache related operations */
 
 struct security_data_block* security_data_block_alloc(struct dm_security* s,
-                                                      sector_t sector,
-                                                      unsigned long long ts);
+                                                      sector_t sector);
 void security_data_block_free(struct security_data_block* data_block);
+int security_cache_lookup_one(struct dm_security* s, sector_t start);
 int security_cache_lookup(struct dm_security* s, struct dm_security_io* io);
 int security_cache_evict(struct dm_security* s, block_t blocks);
-int security_cache_insert(struct dm_security* s,
-                          struct dm_security_io* io,
-                          unsigned long long ts);
+int security_cache_merge(struct dm_security* s, struct dm_security_io* io);
+int security_cache_insert(struct dm_security* s, struct dm_security_io* io);
 void security_queue_cache(struct dm_security_io* io);
 int security_cache_transfer(void* data);
 int security_cache_task_start(struct security_cache_task* sht,

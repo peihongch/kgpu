@@ -109,11 +109,17 @@ struct security_leaf_node* security_get_leaf_node(struct dm_security* s,
 
     rcu_read_lock();
     leaves = rcu_dereference(mn->leaves);
-    rcu_read_unlock();
-    if (leaves)
+    if (leaves) {
         ln = leaves[MASK_BITS(index, s->leaves_per_node_bits)];
+        security_leaf_node_inc_ref(ln);
+    }
+    rcu_read_unlock();
 
     return ln;
+}
+
+void security_put_leaf_node(struct security_leaf_node* ln) {
+    security_leaf_node_dec_ref(ln);
 }
 
 struct security_leaf_node* security_get_or_alloc_leaf_node(
@@ -126,7 +132,6 @@ struct security_leaf_node* security_get_or_alloc_leaf_node(
 
     if (index >= s->hash_leaf_nodes)
         return NULL;
-
 
     ln = security_get_leaf_node(s, index);
     if (ln)

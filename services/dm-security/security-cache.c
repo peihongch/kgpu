@@ -1,8 +1,7 @@
 #include "dm-security.h"
 
 struct security_data_block* security_data_block_alloc(struct dm_security* s,
-                                                      sector_t sector,
-                                                      unsigned long long ts) {
+                                                      sector_t sector) {
     struct security_data_block* block = NULL;
 
     block = kmalloc(sizeof(struct security_data_block), GFP_NOIO);
@@ -14,7 +13,6 @@ struct security_data_block* security_data_block_alloc(struct dm_security* s,
     if (!block->buf)
         goto bad;
 
-    block->timestamp = ts;
     block->start = sector;
     block->dirty = true;
     atomic_set(&block->ref_count, 1);
@@ -44,6 +42,23 @@ void security_data_block_inc_ref(struct security_data_block* data_block) {
 void security_data_block_dec_ref(struct security_data_block* data_block) {
     if (atomic_dec_and_test(&data_block->ref_count))
         security_data_block_free(data_block);
+}
+
+/**
+ * @return 1 on success, 0 on failure
+ */
+int security_cache_lookup_one(struct dm_security* s, sector_t start) {
+    struct data_blocks_cache* cache = &s->data_blocks_cache;
+    struct security_data_block* block;
+    int ret = 0;
+
+    rcu_read_lock();
+    block = radix_tree_lookup(&cache->rt_root, start);
+    if (block)
+        ret = 1;
+    rcu_read_unlock();
+
+    return ret;
 }
 
 /**
@@ -148,11 +163,99 @@ out:
 }
 
 /**
+ * put data block into cache if not exist,
+ * otherwise, update data block in io
+ *
  * @return 0 on success, -errno on failure
  */
-int security_cache_insert(struct dm_security* s,
-                          struct dm_security_io* io,
-                          unsigned long long ts) {
+int security_cache_merge(struct dm_security* s, struct dm_security_io* io) {
+    struct data_blocks_cache* cache = &s->data_blocks_cache;
+    struct security_data_block* block = NULL;
+    struct bio* bio = io->bio;
+    struct bio_vec* bvec;
+    block_t i, blocks = bio->bi_size >> s->data_block_bits;
+    sector_t cur = bio->bi_sector,
+             step = 1 << (s->data_block_bits - SECTOR_SHIFT);
+    size_t bs = 1 << s->data_block_bits, size;
+    unsigned idx, offset, len, ret = 0;
+
+    idx = offset = 0;
+    cur = bio->bi_sector;
+    for (i = 0; i < blocks; i++) {
+        mutex_lock(&cache->lock);
+        /* check if data block already in cache */
+        block = radix_tree_lookup(&cache->rt_root, cur);
+        if (block) {
+            /* copy data block in cache to bio */
+            size = 0;
+            while (size < bs) {
+                bvec = bio_iovec_idx(bio, idx);
+                len = min(bs - size, (size_t)bvec->bv_len);
+                memcpy(page_address(bvec->bv_page) + bvec->bv_offset + offset,
+                       block->buf + size, len);
+                size += len;
+                offset += len;
+                if (offset >= bvec->bv_len) {
+                    offset = 0;
+                    idx++;
+                }
+            }
+            list_move_tail(&block->lru_item, &cache->lru_list);
+            synchronize_rcu();
+            mutex_unlock(&cache->lock);
+        } else {
+            /* make sure cache can hold the new data block */
+            while (cache->size >= cache->capacity) {
+                mutex_unlock(&cache->lock);
+                if (security_cache_evict(s, 1))
+                    cond_resched();
+                mutex_lock(&cache->lock);
+            }
+            mutex_unlock(&cache->lock);
+
+            /* allocate new data block */
+            block = security_data_block_alloc(s, cur);
+            if (!block) {
+                ret = -ENOMEM;
+                goto out;
+            }
+
+            /* copy bio data into new data block */
+            size = bs;
+            while (size) {
+                bvec = bio_iovec_idx(bio, idx);
+                len = min(size, (size_t)bvec->bv_len);
+                memcpy(block->buf,
+                       page_address(bvec->bv_page) + bvec->bv_offset + offset,
+                       len);
+                size -= len;
+                offset += len;
+                if (offset >= bvec->bv_len) {
+                    offset = 0;
+                    idx++;
+                }
+            }
+
+            mutex_lock(&cache->lock);
+            /* insert new data block into cache */
+            radix_tree_insert(&cache->rt_root, cur, block);
+            list_add_tail_rcu(&block->lru_item, &cache->lru_list);
+            synchronize_rcu();
+            cache->size++;
+            mutex_unlock(&cache->lock);
+        }
+
+        cur += step;
+    }
+
+out:
+    return ret;
+}
+
+/**
+ * @return 0 on success, -errno on failure
+ */
+int security_cache_insert(struct dm_security* s, struct dm_security_io* io) {
     struct data_blocks_cache* cache = &s->data_blocks_cache;
     struct security_data_block *block = NULL, *tmp;
     struct bio* bio = io->bio;
@@ -167,7 +270,7 @@ int security_cache_insert(struct dm_security* s,
     cur = bio->bi_sector;
     for (i = 0; i < blocks; i++) {
         /* allocate new data block */
-        block = security_data_block_alloc(s, cur, ts);
+        block = security_data_block_alloc(s, cur);
         if (!block) {
             ret = -ENOMEM;
             goto out;
@@ -229,13 +332,13 @@ void security_queue_cache(struct dm_security_io* io) {
     struct dm_security* s = io->s;
     struct security_cache_task* sct = &s->cache_transferer;
     struct cache_transfer_item* item = NULL;
-    ktime_t ktime = ktime_get();
+
+    pr_info("security_queue_cache: 1\n");
 
     item = kzalloc(sizeof(*item), GFP_NOIO);
     if (!item)
         return;
     item->io = io;
-    item->timestamp = ktime_to_ns(ktime);
     mutex_init(&item->lock);
 
     mutex_lock(&sct->queue_lock);
@@ -283,7 +386,7 @@ int security_cache_transfer(void* data) {
 
         /* 2. Insert bio to cache */
         io = item->io;
-        ret = security_cache_insert(s, io, item->timestamp);
+        ret = security_cache_insert(s, io);
         if (ret) {
             DMERR("Failed to insert cache");
             mutex_lock(&sht->queue_lock);
@@ -299,8 +402,8 @@ int security_cache_transfer(void* data) {
         /**
          * Prefetch hash leaves and do security convertion at the same time
          */
-        security_prefetch_hash_leaves(io->hash_io);
-        ksecurityd_queue_security(io);
+        // security_prefetch_hash_leaves(io->hash_io);
+        // ksecurityd_queue_security(io);
 
         kfree(item);
     }
