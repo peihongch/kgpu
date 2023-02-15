@@ -4,7 +4,7 @@
 
 obj-m += dm-security.o
 
-dm-security-objs := security-common.o security-convert.o security-cache.o security-hash-tree.o security-super-block.o security-core.o
+dm-security-objs := security-common.o security-debug.o security-convert.o security-cache.o security-hash-tree.o security-super-block.o security-core.o
 
 # 
 # 内核模块编译时搜索Module.symvers的路径是：
@@ -18,7 +18,11 @@ dm-security-objs := security-common.o security-convert.o security-cache.o securi
 
 all:
 	make -C /lib/modules/$(shell uname -r)/build M=$(shell pwd) KBUILD_EXTRA_SYMBOLS=$(shell pwd)/../trusted-storage/Module.symvers modules
-	$(if $(BUILD_DIR), cp dm-security.ko $(BUILD_DIR)/ ) 
+	$(if $(BUILD_DIR), cp dm-security.ko $(BUILD_DIR)/ )
+
+debug:
+	make -C /lib/modules/$(shell uname -r)/build M=$(shell pwd) KBUILD_EXTRA_SYMBOLS=$(shell pwd)/../trusted-storage/Module.symvers modules
+	$(if $(BUILD_DIR), cp dm-security.ko $(BUILD_DIR)/ ) -DCONFIG_SECURITY_DEBUG
 
 clean:
 	make -C /lib/modules/$(shell uname -r)/build M=$(shell pwd) KBUILD_EXTRA_SYMBOLS=$(shell pwd)/../trusted-storage/Module.symvers clean

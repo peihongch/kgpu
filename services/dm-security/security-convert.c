@@ -410,15 +410,21 @@ int ksecurityd_io_read(struct dm_security_io* io, gfp_t gfp) {
     struct bio* bio = io->bio;
     struct bio* clone;
 
+    pr_info("ksecurityd_io_read: io->sector = %lu\n", io->sector);
+
     /**
      * Check if data present in cache.
      * Always use io->sector here, not bio->bi_sector
      */
     if (!security_cache_lookup(s, io)) {
+        pr_info("ksecurityd_io_read: data present in cache, io->sector = %lu\n",
+                io->sector);
         bio_endio(bio, 0);
         return 0;
     }
 
+    pr_info("ksecurityd_io_read: prefetch hash_leaves, hash_io->offset = %lu\n",
+            io->hash_io->offset);
     security_prefetch_hash_leaves(io->hash_io);
 
     /*
@@ -426,6 +432,7 @@ int ksecurityd_io_read(struct dm_security_io* io, gfp_t gfp) {
      * copy the required bvecs because we need the original
      * one in order to decrypt the whole bio data *afterwards*.
      */
+    pr_info("ksecurityd_io_read: bio_clone_bioset\n");
     clone = bio_clone_bioset(bio, gfp, s->bs);
     if (!clone)
         return 1;
@@ -435,6 +442,8 @@ int ksecurityd_io_read(struct dm_security_io* io, gfp_t gfp) {
     clone_init(io, clone);
     clone->bi_sector = security_map_data_sector(s, io->sector);
 
+    pr_info("ksecurityd_io_read: generic_make_request, bio->bi_sector = %lu\n",
+            clone->bi_sector);
     generic_make_request(clone);
     return 0;
 }
@@ -519,18 +528,22 @@ void ksecurityd_security_write_convert(struct dm_security_io* io) {
      */
     security_inc_pending(io);
     security_convert_init(s, &io->ctx, NULL, io->bio, hash_bio, sector);
+    pr_info("ksecurityd_security_write_convert: 1\n");
 
     /*
      * The allocated buffers can be smaller than the whole bio,
      * so repeat the whole process until all the data can be handled.
      */
     while (remaining) {
+        pr_info("ksecurityd_security_write_convert: 2\n");
         /* clone bio and alloc new pages so as not to modify orignal data */
         clone = security_alloc_buffer(io, remaining, &out_of_pages);
         if (unlikely(!clone)) {
+            pr_info("ksecurityd_security_write_convert: 3\n");
             io->error = -ENOMEM;
             break;
         }
+        pr_info("ksecurityd_security_write_convert: 4\n");
 
         io->ctx.bio_out = clone;
         io->ctx.idx_out = 0;
@@ -540,14 +553,17 @@ void ksecurityd_security_write_convert(struct dm_security_io* io) {
 
         security_inc_pending(io);
 
+        pr_info("ksecurityd_security_write_convert: 5\n");
         r = security_convert(s, &io->ctx);
         if (r < 0)
             io->error = -EIO;
 
+        pr_info("ksecurityd_security_write_convert: 6\n");
         security_finished = atomic_dec_and_test(&io->ctx.s_pending);
 
         /* sync */
         /* Encryption was already finished, submit io now */
+        pr_info("ksecurityd_security_write_convert: 7\n");
         if (security_finished) {
             pr_info("ksecurityd_security_write_convert: security finished\n");
             // ksecurityd_security_write_io_submit(io, 0);
@@ -557,6 +573,7 @@ void ksecurityd_security_write_convert(struct dm_security_io* io) {
              * If there was an error, do not try next fragments.
              * For async, error is processed in async handler.
              */
+            pr_info("ksecurityd_security_write_convert: 8\n");
             if (unlikely(r < 0))
                 break;
 
@@ -567,6 +584,7 @@ void ksecurityd_security_write_convert(struct dm_security_io* io) {
          * Out of memory -> run queues
          * But don't wait if split was due to the io size restriction
          */
+        pr_info("ksecurityd_security_write_convert: 9\n");
         if (unlikely(out_of_pages))
             congestion_wait(BLK_RW_ASYNC, HZ / 100);
 
@@ -574,7 +592,9 @@ void ksecurityd_security_write_convert(struct dm_security_io* io) {
          * With async crypto it is unsafe to share the crypto context
          * between fragments, so switch to a new dm_security_io structure.
          */
+        pr_info("ksecurityd_security_write_convert: 10\n");
         if (unlikely(!security_finished && remaining)) {
+            pr_info("ksecurityd_security_write_convert: 11\n");
             new_io = security_io_alloc(io->s, io->bio, sector);
             security_inc_pending(new_io);
             security_convert_init(s, &new_io->ctx, NULL, io->bio, io->hash_bio,
@@ -588,16 +608,21 @@ void ksecurityd_security_write_convert(struct dm_security_io* io) {
              * Fragments after the first use the base_io
              * pending count.
              */
+            pr_info("ksecurityd_security_write_convert: 12\n");
             if (!io->base_io)
                 new_io->base_io = io;
             else {
+                pr_info("ksecurityd_security_write_convert: 14\n");
                 new_io->base_io = io->base_io;
                 security_inc_pending(io->base_io);
                 security_dec_pending(io);
             }
 
+            pr_info("ksecurityd_security_write_convert: 15\n");
             io = new_io;
         }
+
+        pr_info("ksecurityd_security_write_convert: 16\n");
     }
 
     pr_info("ksecurityd_security_write_convert: security_dec_pending\n");
@@ -622,29 +647,38 @@ void ksecurityd_security_read_convert(struct dm_security_io* io) {
     u8* tag_addr = NULL;
     int r = 0, i;
 
+    pr_info("ksecurityd_security_read_convert: 1\n");
+
     security_inc_pending(io);
 
     security_convert_init(s, &io->ctx, io->bio, io->bio, io->hash_bio,
                           io->sector);
 
+    pr_info("ksecurityd_security_read_convert: 2\n");
     r = security_convert(s, &io->ctx);
     if (r < 0)
         io->error = -EIO;
 
+    pr_info("ksecurityd_security_read_convert: 3\n");
     /* wait for hash prefetch io to complete */
     wait_for_completion(&hash_io->restart);
 
     idx_tag = offset_tag = 0;
+    pr_info("ksecurityd_security_read_convert: 4\n");
     for (i = 0; i < hash_io->count; i++) {
+        bv_tag = bio_iovec_idx(io->hash_bio, idx_tag);
+
         /* check if corresponding data block in cache */
+        pr_info("ksecurityd_security_read_convert: 5, i = %d\n", i);
         if (!security_cache_lookup_one(s, io->sector + i * bs)) {
             /* if not in cache, check if tags match */
-            bv_tag = bio_iovec_idx(io->hash_bio, idx_tag);
+            pr_info("ksecurityd_security_read_convert: 6, block->start = %lu\n",
+                    io->sector + i * bs);
+            ln = security_get_leaf_node(s, i + hash_io->offset);
             tag_addr =
                 page_address(bv_tag->bv_page) + bv_tag->bv_offset + offset_tag;
 
-            ln = security_get_leaf_node(s, i + hash_io->offset);
-
+            pr_info("ksecurityd_security_read_convert: 6.2\n");
             mutex_lock(&ln->lock);
             BUG_ON(!ln || !ln->verified);
             if (ln->corrupted || memcmp(tag_addr, ln->digest, tag_size)) {
@@ -665,10 +699,13 @@ void ksecurityd_security_read_convert(struct dm_security_io* io) {
                 goto out;
             }
             mutex_unlock(&ln->lock);
+            pr_info("ksecurityd_security_read_convert: 6.3\n");
 
             /* enable leaf node to be reclaimed */
             security_put_leaf_node(ln);
+            pr_info("ksecurityd_security_read_convert: 6.4\n");
         }
+        pr_info("ksecurityd_security_read_convert: 7\n");
 
         offset_tag += tag_size;
         if (offset_tag >= bv_tag->bv_len) {
@@ -678,12 +715,16 @@ void ksecurityd_security_read_convert(struct dm_security_io* io) {
     }
 
     /* put data into data blocks cache */
+    pr_info("ksecurityd_security_read_convert: 8\n");
     security_cache_merge(s, io);
+
+    pr_info("ksecurityd_security_read_convert: 9\n");
 
 out:
     if (atomic_dec_and_test(&io->ctx.s_pending))
         ksecurityd_security_read_done(io);
 
+    pr_info("ksecurityd_security_read_convert: 10\n");
     security_dec_pending(io);
 }
 
@@ -722,7 +763,7 @@ void ksecurityd_security(struct work_struct* work) {
     unsigned nr_iovecs = DIV_ROUND_UP_BITS(remainings, PAGE_SHIFT);
     unsigned len = 0;
 
-    pr_info("ksecurityd_security: start\n");
+    pr_info("ksecurityd_security: start, nr_iovecs = %u\n", nr_iovecs);
 
     /* alloc hash bio to hold generated authentication tags */
     hash_bio = bio_alloc_bioset(GFP_NOIO, nr_iovecs, s->bs);
@@ -730,18 +771,24 @@ void ksecurityd_security(struct work_struct* work) {
     hash_bio->bi_bdev = s->dev->bdev;
     hash_bio->bi_rw |= bio_data_dir(bio);
 
+    pr_info("ksecurityd_security: 1\n");
+
     while (nr_iovecs--) {
         page = mempool_alloc(s->page_pool, GFP_NOIO | __GFP_HIGHMEM);
         len = min(remainings, (unsigned)PAGE_SIZE);
+        pr_info("ksecurityd_security: 2\n");
         if (!bio_add_page(hash_bio, page, len, 0)) {
+            pr_info("ksecurityd_security: 3\n");
             mempool_free(page, s->page_pool);
             break;
         }
+        pr_info("ksecurityd_security: 4\n");
         remainings -= len;
     }
     io->hash_bio = hash_bio;
     hash_io->base_io = io;
 
+    pr_info("ksecurityd_security: 5\n");
     if (bio_data_dir(io->bio) == READ)
         ksecurityd_security_read_convert(io);
     else

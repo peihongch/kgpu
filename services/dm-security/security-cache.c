@@ -52,12 +52,18 @@ int security_cache_lookup_one(struct dm_security* s, sector_t start) {
     struct security_data_block* block;
     int ret = 0;
 
+    pr_info("security_cache_lookup_one: start=%lu\n", start);
+
     rcu_read_lock();
+    pr_info("security_cache_lookup_one: 1\n");
     block = radix_tree_lookup(&cache->rt_root, start);
+    pr_info("security_cache_lookup_one: 2, block = %p\n", block);
     if (block)
         ret = 1;
+    pr_info("security_cache_lookup_one: 3, ret = %d\n", ret);
     rcu_read_unlock();
 
+    pr_info("security_cache_lookup_one: 4\n");
     return ret;
 }
 
@@ -181,11 +187,14 @@ int security_cache_merge(struct dm_security* s, struct dm_security_io* io) {
 
     idx = offset = 0;
     cur = bio->bi_sector;
+    pr_info("security_cache_merge: 1\n");
     for (i = 0; i < blocks; i++) {
         mutex_lock(&cache->lock);
         /* check if data block already in cache */
         block = radix_tree_lookup(&cache->rt_root, cur);
+        pr_info("security_cache_merge: 2\n");
         if (block) {
+            pr_info("security_cache_merge: 3\n");
             /* copy data block in cache to bio */
             size = 0;
             while (size < bs) {
@@ -200,10 +209,12 @@ int security_cache_merge(struct dm_security* s, struct dm_security_io* io) {
                     idx++;
                 }
             }
+            pr_info("security_cache_merge: 4\n");
             list_move_tail(&block->lru_item, &cache->lru_list);
             synchronize_rcu();
             mutex_unlock(&cache->lock);
         } else {
+            pr_info("security_cache_merge: 5\n");
             /* make sure cache can hold the new data block */
             while (cache->size >= cache->capacity) {
                 mutex_unlock(&cache->lock);
@@ -214,6 +225,7 @@ int security_cache_merge(struct dm_security* s, struct dm_security_io* io) {
             mutex_unlock(&cache->lock);
 
             /* allocate new data block */
+            pr_info("security_cache_merge: 6\n");
             block = security_data_block_alloc(s, cur);
             if (!block) {
                 ret = -ENOMEM;
@@ -222,6 +234,7 @@ int security_cache_merge(struct dm_security* s, struct dm_security_io* io) {
 
             /* copy bio data into new data block */
             size = bs;
+            pr_info("security_cache_merge: 7\n");
             while (size) {
                 bvec = bio_iovec_idx(bio, idx);
                 len = min(size, (size_t)bvec->bv_len);
@@ -236,6 +249,7 @@ int security_cache_merge(struct dm_security* s, struct dm_security_io* io) {
                 }
             }
 
+            pr_info("security_cache_merge: 8\n");
             mutex_lock(&cache->lock);
             /* insert new data block into cache */
             radix_tree_insert(&cache->rt_root, cur, block);
@@ -243,12 +257,16 @@ int security_cache_merge(struct dm_security* s, struct dm_security_io* io) {
             synchronize_rcu();
             cache->size++;
             mutex_unlock(&cache->lock);
+            pr_info("security_cache_merge: 9\n");
         }
 
+        pr_info("security_cache_merge: 10\n");
         cur += step;
     }
 
+    pr_info("security_cache_merge: 11\n");
 out:
+    pr_info("security_cache_merge: 12\n");
     return ret;
 }
 
@@ -341,12 +359,15 @@ void security_queue_cache(struct dm_security_io* io) {
     item->io = io;
     mutex_init(&item->lock);
 
+    pr_info("security_queue_cache: 2\n");
     mutex_lock(&sct->queue_lock);
     list_add_tail_rcu(&item->list, &sct->queue);
     synchronize_rcu();
     mutex_unlock(&sct->queue_lock);
 
+    pr_info("security_queue_cache: 3\n");
     complete(&sct->wait);
+    pr_info("security_queue_cache: 4\n");
 }
 
 int security_cache_transfer(void* data) {
@@ -379,34 +400,45 @@ int security_cache_transfer(void* data) {
         if (!item)
             continue;
 
+        pr_info("security_cache_transfer: 1\n");
         mutex_lock(&item->lock);
         list_del_rcu(&item->list);
         synchronize_rcu();
         mutex_unlock(&item->lock);
 
         /* 2. Insert bio to cache */
+        pr_info("security_cache_transfer: 2\n");
         io = item->io;
         ret = security_cache_insert(s, io);
+        pr_info("security_cache_transfer: 3\n");
         if (ret) {
             DMERR("Failed to insert cache");
             mutex_lock(&sht->queue_lock);
             list_add_tail_rcu(&item->list, &sht->queue);
             synchronize_rcu();
             mutex_unlock(&sht->queue_lock);
+            pr_info("security_cache_transfer: 4\n");
             continue;
         }
 
         /* 3. Go ahead processing */
+        pr_info("security_cache_transfer: 5\n");
         bio_endio(io->bio, 0);
 
         /**
          * Prefetch hash leaves and do security convertion at the same time
          */
-        // security_prefetch_hash_leaves(io->hash_io);
-        // ksecurityd_queue_security(io);
+        pr_info("security_cache_transfer: 6\n");
+        security_prefetch_hash_leaves(io->hash_io);
+        pr_info("security_cache_transfer: 7\n");
+        ksecurityd_queue_security(io);
+        pr_info("security_cache_transfer: 8\n");
 
         kfree(item);
+        pr_info("security_cache_transfer: 9\n");
     }
+
+    pr_info("security_cache_transfer: 10\n");
 
 out:
     DMINFO("Security cache transferer stopped (pid %d)", current->pid);

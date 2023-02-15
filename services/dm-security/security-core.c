@@ -1025,26 +1025,25 @@ static int security_map(struct dm_target* ti, struct bio* bio) {
         return DM_MAPIO_REMAPPED;
     }
 
-    pr_info(
-        "security_map: 3, rw = %s, bio->bi_sector = %lu, dm_target_offset = "
-        "%u\n",
-        bio->bi_rw == READ ? "READ" : "WRITE", bio->bi_sector,
-        dm_target_offset(ti, bio->bi_sector));
     io = security_io_alloc(s, bio, dm_target_offset(ti, bio->bi_sector));
+    pr_info(
+        "security_map: 3, rw = %s, bio->bi_sector = %lu, bio->bi_size = %u, "
+        "dm_target_offset = %u, io->sector = %lu\n",
+        bio->bi_rw == READ ? "READ" : "WRITE", bio->bi_sector, bio->bi_size,
+        dm_target_offset(ti, bio->bi_sector), io->sector);
 
-    pr_info("security_map: 4, io->sector = %lu\n", io->sector);
     if (bio_data_dir(io->bio) == READ) {
-        pr_info("security_map: 5\n");
+        pr_info("security_map: 4\n");
         if (ksecurityd_io_read(io, GFP_NOWAIT)) {
-            pr_info("security_map: 6\n");
+            pr_info("security_map: 5\n");
             ksecurityd_queue_io(io);
         }
     } else {
-        pr_info("security_map: 7\n");
+        pr_info("security_map: 6\n");
         security_queue_cache(io);
     }
 
-    pr_info("security_map: 8\n");
+    pr_info("security_map: 7\n");
     return DM_MAPIO_SUBMITTED;
 }
 

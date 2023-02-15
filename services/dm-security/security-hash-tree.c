@@ -173,14 +173,16 @@ int security_prefetch_hash_leaves(struct security_hash_io* io) {
     size_t start, count;
     int ret = 0;
 
-    pr_info("security_prefetch_hash_leaves: offset=%lu, count=%lu\n",
+    pr_info("security_prefetch_hash_leaves: offset = %lu, count = %lu\n",
             io->offset, io->count);
     item = kmalloc(sizeof(struct hash_prefetch_item), GFP_NOIO);
     if (!item) {
+        pr_info("security_prefetch_hash_leaves: 1\n");
         ret = -ENOMEM;
         goto out;
     }
 
+    pr_info("security_prefetch_hash_leaves: 2\n");
     start = UMASK_BITS(io->offset, s->leaves_per_node_bits);
     if (UMASK_BITS(io->offset + io->count, s->leaves_per_node_bits) == start)
         count = leaves_per_node;
@@ -196,14 +198,17 @@ int security_prefetch_hash_leaves(struct security_hash_io* io) {
     init_hash_prefetch_item(item, start, count);
     list_add_tail(&io->list, &item->wait_list);
 
+    pr_info("security_prefetch_hash_leaves: 3\n");
     mutex_lock(&prefetcher->pre_queue_lock);
     list_add_tail_rcu(&item->list, &prefetcher->pre_queue);
     synchronize_rcu();
     mutex_unlock(&prefetcher->pre_queue_lock);
 
+    pr_info("security_prefetch_hash_leaves: 4\n");
     complete(&prefetcher->pre_wait);
 
 out:
+    pr_info("security_prefetch_hash_leaves: 5\n");
     return ret;
 }
 
@@ -801,7 +806,7 @@ int security_hash_flush(void* data) {
         init_completion(&sht->wait);
         wait_for_completion_timeout(&sht->wait, HASH_FLUSH_TIMEOUT);
 
-        pr_info("security_hash_flush: 1\n");
+        // pr_info("security_hash_flush: 1\n");
 
         mutex_lock(&sht->queue_lock);
 
@@ -819,7 +824,7 @@ int security_hash_flush(void* data) {
         ln = list_first_entry_or_null(&sht->queue, struct security_leaf_node,
                                       flush_list);
         if (!ln) {
-            pr_info("security_hash_flush: 3\n");
+            // pr_info("security_hash_flush: 3\n");
             mutex_unlock(&sht->queue_lock);
             continue;
         }
