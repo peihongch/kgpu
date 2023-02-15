@@ -63,16 +63,16 @@ int security_cache_lookup(struct dm_security* s, struct dm_security_io* io) {
     size_t bs = 1 << s->data_block_bits;
     unsigned i, idx, offset, len, ret = 0;
 
-    rcu_read_lock();
-
     /* Firstly, check if all data blocks in cache */
     idx = offset = 0;
+    rcu_read_lock();
     radix_tree_for_each_slot(slot, &cache->rt_root, &iter, start) {
         block = *slot;
         if ((block->start != cur) || (block->start >= start + sectors))
             break;
         cur += step;
     }
+    rcu_read_unlock();
 
     if (cur != start + sectors) {
         ret = -EIO;
@@ -81,15 +81,15 @@ int security_cache_lookup(struct dm_security* s, struct dm_security_io* io) {
 
     /* Copy cached data to bio if all data blocks exist */
     idx = offset = 0;
+    mutex_lock(&cache->lock);
     radix_tree_for_each_slot(slot, &cache->rt_root, &iter, start) {
         block = *slot;
         if (block->start >= start + sectors)
             break;
 
         /* update lru cache */
-        mutex_lock(&cache->lru_lock);
         list_move_tail(&block->lru_item, &cache->lru_list);
-        mutex_unlock(&cache->lru_lock);
+        synchronize_rcu();
 
         /* copy cached data to bio */
         i = bs;
@@ -106,10 +106,9 @@ int security_cache_lookup(struct dm_security* s, struct dm_security_io* io) {
             }
         }
     }
+    mutex_unlock(&cache->lock);
 
 out:
-    rcu_read_unlock();
-
     return ret;
 }
 
@@ -119,44 +118,32 @@ out:
 int security_cache_evict(struct dm_security* s, block_t blocks) {
     struct data_blocks_cache* cache = &s->data_blocks_cache;
     struct security_hash_task* flusher = &s->hash_flusher;
-    struct security_data_block *block, *tmp;
+    struct security_data_block* block;
     int ret = 0;
 
-    mutex_lock(&cache->lru_lock);
+    mutex_lock(&cache->lock);
 
     if (!cache->size)
         goto out;
 
-    list_for_each_entry_safe(block, tmp, &cache->lru_list, lru_item) {
-        security_data_block_inc_ref(block);
-        mutex_lock(&block->lock);
-
-        if (block->dirty) {
-            mutex_unlock(&block->lock);
-            security_data_block_dec_ref(block);
+    list_for_each_entry_rcu(block, &cache->lru_list, lru_item) {
+        if (block->dirty)
             continue;
-        }
 
-        mutex_lock(&cache->rt_lock);
         radix_tree_delete(&cache->rt_root, block->start);
-        mutex_unlock(&cache->rt_lock);
-
-        list_del(&block->lru_item);
-        mutex_unlock(&block->lock);
-        security_data_block_dec_ref(block);
-
+        list_del_rcu(&block->lru_item);
+        synchronize_rcu();
+        security_data_block_free(block);
         cache->size--;
 
         if (blocks-- == 0)
             break;
     }
 
-out:
-    mutex_unlock(&cache->lru_lock);
-
     if (blocks)
         complete(&flusher->wait);
-
+out:
+    mutex_unlock(&cache->lock);
     return ret;
 }
 
@@ -167,36 +154,26 @@ int security_cache_insert(struct dm_security* s,
                           struct dm_security_io* io,
                           unsigned long long ts) {
     struct data_blocks_cache* cache = &s->data_blocks_cache;
-    struct security_data_block* block = NULL;
+    struct security_data_block *block = NULL, *tmp;
     struct bio* bio = io->bio;
     struct bio_vec* bvec;
-    block_t blocks = bio->bi_size >> s->data_block_bits;
-    block_t remainings = blocks, i;
+    block_t i, blocks = bio->bi_size >> s->data_block_bits;
     sector_t cur = bio->bi_sector,
              step = 1 << (s->data_block_bits - SECTOR_SHIFT);
     size_t bs = 1 << s->data_block_bits, size;
     unsigned idx, offset, len, ret = 0;
 
-    mutex_lock(&cache->lru_lock);
-    while (cache->size + blocks > cache->capacity) {
-        mutex_unlock(&cache->lru_lock);
-        remainings = security_cache_evict(s, remainings);
-        if (remainings)
-            cond_resched();
-        mutex_lock(&cache->lru_lock);
-    }
-    mutex_unlock(&cache->lru_lock);
-
     idx = offset = 0;
+    cur = bio->bi_sector;
     for (i = 0; i < blocks; i++) {
+        /* allocate new data block */
         block = security_data_block_alloc(s, cur, ts);
         if (!block) {
             ret = -ENOMEM;
             goto out;
         }
-        block->timestamp = ts;
 
-        /* copy bio data to cache */
+        /* copy bio data into new data block */
         size = bs;
         while (size) {
             bvec = bio_iovec_idx(bio, idx);
@@ -211,14 +188,35 @@ int security_cache_insert(struct dm_security* s,
             }
         }
 
-        mutex_lock(&cache->rt_lock);
-        radix_tree_insert(&cache->rt_root, block->start, block);
-        mutex_unlock(&cache->rt_lock);
+        mutex_lock(&cache->lock);
 
-        mutex_lock(&cache->lru_lock);
-        list_add_tail(&block->lru_item, &cache->lru_list);
+        /* check if data block already in cache */
+        if (radix_tree_lookup(&cache->rt_root, cur)) {
+            radix_tree_delete(&cache->rt_root, cur);
+            list_for_each_entry_rcu(tmp, &cache->lru_list, lru_item) {
+                if (tmp->start == cur) {
+                    list_del_rcu(&tmp->lru_item);
+                    break;
+                }
+            }
+        } else {
+            /* make sure cache can hold the new data block */
+            while (cache->size >= cache->capacity) {
+                mutex_unlock(&cache->lock);
+                if (security_cache_evict(s, 1))
+                    cond_resched();
+                mutex_lock(&cache->lock);
+            }
+        }
+
+        /* insert new data block into cache */
+        radix_tree_insert(&cache->rt_root, cur, block);
+        list_add_tail_rcu(&block->lru_item, &cache->lru_list);
+        synchronize_rcu();
+
         cache->size++;
-        mutex_unlock(&cache->lru_lock);
+
+        mutex_unlock(&cache->lock);
 
         cur += step;
     }
@@ -238,9 +236,11 @@ void security_queue_cache(struct dm_security_io* io) {
         return;
     item->io = io;
     item->timestamp = ktime_to_ns(ktime);
+    mutex_init(&item->lock);
 
     mutex_lock(&sct->queue_lock);
-    list_add_tail(&item->list, &sct->queue);
+    list_add_tail_rcu(&item->list, &sct->queue);
+    synchronize_rcu();
     mutex_unlock(&sct->queue_lock);
 
     complete(&sct->wait);
@@ -260,30 +260,36 @@ int security_cache_transfer(void* data) {
         wait_for_completion_timeout(&sht->wait, CACHE_TRANSFER_TIMEOUT);
         reinit_completion(&sht->wait);
 
-        mutex_lock(&sht->queue_lock);
-
-        /* Exit prefetch thread */
+        rcu_read_lock();
         if (kthread_should_stop() && list_empty(&sht->queue)) {
+            rcu_read_unlock();
+            /* Exit prefetch thread */
             sht->stopped = true;
-            mutex_unlock(&sht->queue_lock);
             ret = 0;
             goto out;
         }
 
         /* 1. Get one item from queue */
-        item = list_first_entry_or_null(&sht->queue, struct cache_transfer_item,
-                                        list);
-        if (!item) {
-            mutex_unlock(&sht->queue_lock);
+        item = list_first_or_null_rcu(&sht->queue, struct cache_transfer_item,
+                                      list);
+        rcu_read_unlock();
+        if (!item)
             continue;
-        }
+
+        mutex_lock(&item->lock);
+        list_del_rcu(&item->list);
+        synchronize_rcu();
+        mutex_unlock(&item->lock);
 
         /* 2. Insert bio to cache */
         io = item->io;
         ret = security_cache_insert(s, io, item->timestamp);
         if (ret) {
             DMERR("Failed to insert cache");
-            list_move_tail(&item->list, &sht->queue);
+            mutex_lock(&sht->queue_lock);
+            list_add_tail_rcu(&item->list, &sht->queue);
+            synchronize_rcu();
+            mutex_unlock(&sht->queue_lock);
             continue;
         }
 

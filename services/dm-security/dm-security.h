@@ -155,6 +155,7 @@ struct hash_update_item {
 struct cache_transfer_item {
     struct list_head list;        /* list_head for transfer queue */
     struct dm_security_io* io;    /* io to transfer */
+    struct mutex lock;            /* lock for cache transfer item */
     unsigned long long timestamp; /* creation timestamp of transfer item */
 };
 
@@ -280,8 +281,7 @@ struct hash_nodes_cache {
 };
 
 struct data_blocks_cache {
-    struct mutex rt_lock;           /* lock for radix tree */
-    struct mutex lru_lock;          /* lock for lru list */
+    struct mutex lock;              /* lock for radix tree */
     struct radix_tree_root rt_root; /* radix tree cache for data blocks */
     struct list_head lru_list;      /* LRU list for data blocks */
     size_t size;                    /* number of data blocks in cache */
@@ -400,8 +400,7 @@ struct security_iv_operations {
 
 #define init_data_blocks_cache(cache, mask)             \
     do {                                                \
-        mutex_init(&(cache)->rt_lock);                  \
-        mutex_init(&(cache)->lru_lock);                 \
+        mutex_init(&(cache)->lock);                     \
         INIT_RADIX_TREE(&(cache)->rt_root, (mask));     \
         INIT_LIST_HEAD(&(cache)->lru_list);             \
         (cache)->size = 0;                              \

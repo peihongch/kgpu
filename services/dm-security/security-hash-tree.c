@@ -193,6 +193,7 @@ int security_prefetch_hash_leaves(struct security_hash_io* io) {
 
     mutex_lock(&prefetcher->pre_queue_lock);
     list_add_tail_rcu(&item->list, &prefetcher->pre_queue);
+    synchronize_rcu();
     mutex_unlock(&prefetcher->pre_queue_lock);
 
     complete(&prefetcher->pre_wait);
