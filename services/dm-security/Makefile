@@ -20,9 +20,5 @@ all:
 	make -C /lib/modules/$(shell uname -r)/build M=$(shell pwd) KBUILD_EXTRA_SYMBOLS=$(shell pwd)/../trusted-storage/Module.symvers modules
 	$(if $(BUILD_DIR), cp dm-security.ko $(BUILD_DIR)/ )
 
-debug:
-	make -C /lib/modules/$(shell uname -r)/build M=$(shell pwd) KBUILD_EXTRA_SYMBOLS=$(shell pwd)/../trusted-storage/Module.symvers modules
-	$(if $(BUILD_DIR), cp dm-security.ko $(BUILD_DIR)/ ) -DCONFIG_SECURITY_DEBUG
-
 clean:
 	make -C /lib/modules/$(shell uname -r)/build M=$(shell pwd) KBUILD_EXTRA_SYMBOLS=$(shell pwd)/../trusted-storage/Module.symvers clean

@@ -346,12 +346,42 @@ out:
     return ret;
 }
 
+int security_cache_flush_prepare(struct dm_security* s,
+                                 struct bio* bio,
+                                 sector_t start,
+                                 block_t blocks) {
+    struct data_blocks_cache* cache = &s->data_blocks_cache;
+    struct security_data_block* block = NULL;
+    unsigned bs = 1 << s->data_block_bits;
+    sector_t step = 1 << (s->data_block_bits - SECTOR_SHIFT);
+    block_t i;
+    void* buf;
+    int ret = 0;
+
+    rcu_read_lock();
+    for (i = 0; i < blocks; i++) {
+        block = radix_tree_lookup(&cache->rt_root, start + i * step);
+        if (block) {
+            buf = block->buf;
+            bio_add_page(bio, virt_to_page(buf), bs, offset_in_page(buf));
+        } else {
+            ret = 1;
+            goto out;
+        }
+    }
+out:
+    rcu_read_unlock();
+    return ret;
+}
+
 void security_queue_cache(struct dm_security_io* io) {
     struct dm_security* s = io->s;
     struct security_cache_task* sct = &s->cache_transferer;
     struct cache_transfer_item* item = NULL;
 
     pr_info("security_queue_cache: 1\n");
+
+    security_inc_pending(io);
 
     item = kzalloc(sizeof(*item), GFP_NOIO);
     if (!item)
@@ -370,12 +400,49 @@ void security_queue_cache(struct dm_security_io* io) {
     pr_info("security_queue_cache: 4\n");
 }
 
+void security_cache_endio(struct bio* bio, int error) {
+    struct dm_security_io* io = bio->bi_private;
+    struct dm_security* s = io->s;
+    struct data_blocks_cache* cache = &s->data_blocks_cache;
+    struct security_data_block* block = NULL;
+    sector_t start = io->sector;
+    block_t blocks = bio->bi_vcnt;
+
+    if (unlikely(!bio_flagged(clone, BIO_UPTODATE) && !error))
+        error = -EIO;
+
+    if (rw == WRITE) {
+        mutex_lock(&cache->lock);
+        for (i = 0; i < blocks; i++) {
+            block = radix_tree_lookup(&cache->rt_root, start + i * step);
+            if (block) {
+                block->dirty = false;
+                synchronize_rcu();
+            } else {
+                error = -EIO;
+                goto out;
+            }
+        }
+        mutex_unlock(&cache->lock);
+    }
+
+    bio_put(bio);
+
+out:
+    if (unlikely(error))
+        io->error = error;
+
+    security_dec_pending(io);
+}
+
 int security_cache_transfer(void* data) {
     struct security_cache_task* sht = data;
     struct dm_security* s =
         container_of(sht, struct dm_security, cache_transferer);
     struct cache_transfer_item* item = NULL;
-    struct dm_security_io* io = NULL;
+    struct dm_security_io *io = NULL, *new_io = NULL;
+    struct bio* bio = NULL;
+    block_t blocks = io->bio->bi_size >> s->data_block_bits;
     int ret;
 
     DMINFO("Security cache transferer started (pid %d)", current->pid);
@@ -413,29 +480,47 @@ int security_cache_transfer(void* data) {
         pr_info("security_cache_transfer: 3\n");
         if (ret) {
             DMERR("Failed to insert cache");
-            mutex_lock(&sht->queue_lock);
-            list_add_tail_rcu(&item->list, &sht->queue);
-            synchronize_rcu();
-            mutex_unlock(&sht->queue_lock);
-            pr_info("security_cache_transfer: 4\n");
-            continue;
+            goto requeue;
         }
 
-        /* 3. Go ahead processing */
-        pr_info("security_cache_transfer: 5\n");
-        bio_endio(io->bio, 0);
-
         /**
-         * Prefetch hash leaves and do security convertion at the same time
+         * 3. Prefetch hash leaves and do security convertion at the same
+         * time
          */
-        pr_info("security_cache_transfer: 6\n");
-        security_prefetch_hash_leaves(io->hash_io);
-        pr_info("security_cache_transfer: 7\n");
+
+        bio = bio_alloc_bioset(GFP_NOIO, blocks, s->bs);
+        if (!bio) {
+            DMERR("Failed to alloc bio");
+            goto requeue;
+        }
+        bio->bi_private = io;
+        bio->bi_end_io = security_cache_endio;
+        bio->bi_bdev = s->dev->bdev;
+        bio->bi_rw = io->bio->bi_rw;
+
+        BUG_ON(security_cache_flush_prepare(s, bio, io->sector, blocks));
+
+        security_inc_pending(io);
+
+        hash_io = security_hash_io_alloc(s, offset, count);
+        security_io_bind(io, hash_io);
+
+        security_prefetch_hash_leaves(hash_io);
         ksecurityd_queue_security(io);
-        pr_info("security_cache_transfer: 8\n");
+
+        /* 4. Go ahead processing */
+        ksecurityd_security_write_io_submit(io);
 
         kfree(item);
         pr_info("security_cache_transfer: 9\n");
+
+        continue;
+
+    requeue:
+        mutex_lock(&sht->queue_lock);
+        list_add_tail_rcu(&item->list, &sht->queue);
+        synchronize_rcu();
+        mutex_unlock(&sht->queue_lock);
     }
 
     pr_info("security_cache_transfer: 10\n");

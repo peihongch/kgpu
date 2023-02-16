@@ -437,7 +437,11 @@ struct security_iv_operations {
 
 /* dm-security generic operations */
 
+void security_io_bind(struct dm_security_io* io,
+                      struct security_hash_io* hash_io);
 void security_free_buffer_pages(struct dm_security* s, struct bio* bio);
+void security_inc_pending(struct dm_security_io* io);
+void security_dec_pending(struct dm_security_io* io);
 sector_t security_map_data_sector(struct dm_security* s, sector_t bi_sector);
 sector_t security_map_hash_sector(struct dm_security* s, sector_t bi_sector);
 

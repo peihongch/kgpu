@@ -1,4 +1,5 @@
 #include "dm-security.h"
+#include "security-debug.h"
 
 static struct security_cpu* this_security_cpu(struct dm_security* s) {
     return this_cpu_ptr(s->cpu);
@@ -234,7 +235,6 @@ int security_convert(struct dm_security* s, struct convert_context* ctx) {
 void security_endio(struct bio* clone, int error) {
     struct dm_security_io* io = clone->bi_private;
     struct security_hash_io* hash_io = io->hash_io;
-    struct dm_security* s = io->s;
     unsigned rw = bio_data_dir(clone);
 
     pr_info("security_endio: 1\n");
@@ -252,7 +252,6 @@ void security_endio(struct bio* clone, int error) {
      */
     if (rw == WRITE) {
         pr_info("security_endio: 3, rw = WRITE\n");
-
         if (hash_io)
             complete(&hash_io->restart);
 
@@ -305,16 +304,21 @@ struct bio* security_alloc_buffer(struct dm_security_io* io,
     unsigned i, len;
     struct page* page;
 
+    pr_info("security_alloc_buffer: 1\n");
+
     clone = bio_alloc_bioset(GFP_NOIO, nr_iovecs, s->bs);
     if (!clone)
         return NULL;
 
+    pr_info("security_alloc_buffer: 2\n");
     clone_init(io, clone);
     *out_of_pages = 0;
 
     for (i = 0; i < nr_iovecs; i++) {
+        pr_info("security_alloc_buffer: 3\n");
         page = mempool_alloc(s->page_pool, gfp_mask);
         if (!page) {
+            pr_info("security_alloc_buffer: 4\n");
             *out_of_pages = 1;
             break;
         }
@@ -328,19 +332,24 @@ struct bio* security_alloc_buffer(struct dm_security_io* io,
 
         len = (size > PAGE_SIZE) ? PAGE_SIZE : size;
 
+        pr_info("security_alloc_buffer: 5\n");
         if (!bio_add_page(clone, page, len, 0)) {
             mempool_free(page, s->page_pool);
+            pr_info("security_alloc_buffer:6\n");
             break;
         }
 
         size -= len;
     }
 
+    pr_info("security_alloc_buffer: 7\n");
     if (!clone->bi_size) {
+        pr_info("security_alloc_buffer: 8\n");
         bio_put(clone);
         return NULL;
     }
 
+    pr_info("security_alloc_buffer: 9\n");
     return clone;
 }
 
@@ -348,67 +357,26 @@ struct dm_security_io* security_io_alloc(struct dm_security* s,
                                          struct bio* bio,
                                          sector_t sector) {
     struct dm_security_io* io;
-    struct security_hash_io* hash_io;
-    size_t offset = sector >> (s->data_block_bits - SECTOR_SHIFT);
-    size_t count = bio->bi_size >> s->data_block_bits;
-
-    hash_io = security_hash_io_alloc(s, offset, count);
 
     io = mempool_alloc(s->io_pool, GFP_NOIO);
     io->s = s;
     io->bio = bio;
     io->sector = sector;
     io->error = 0;
-    io->hash_io = hash_io;
+    io->hash_io = NULL;
     io->base_io = NULL;
     atomic_set(&io->io_pending, 0);
-
-    hash_io->base_io = io;
 
     return io;
 }
 
-void security_inc_pending(struct dm_security_io* io) {
-    atomic_inc(&io->io_pending);
-}
-
-/*
- * One of the bios was finished. Check for completion of
- * the whole request and correctly clean up the buffer.
- * If base_io is set, wait for the last fragment to complete.
- */
-void security_dec_pending(struct dm_security_io* io) {
-    struct dm_security* s = io->s;
-    struct bio* bio = io->bio;
-    struct dm_security_io* base_io = io->base_io;
-    int error = io->error;
-
-    if (!atomic_dec_and_test(&io->io_pending))
-        return;
-
-    if (io->hash_bio) {
-        security_free_buffer_pages(s, io->hash_bio);
-        bio_put(io->hash_bio);
-        security_hash_io_free(io->hash_io);
-    }
-
-    mempool_free(io, s->io_pool);
-
-    if (bio_data_dir(bio) == READ) {
-        if (likely(!base_io))
-            bio_endio(bio, error);
-        else {
-            if (error && !base_io->error)
-                base_io->error = error;
-            security_dec_pending(base_io);
-        }
-    }
-}
-
 int ksecurityd_io_read(struct dm_security_io* io, gfp_t gfp) {
     struct dm_security* s = io->s;
+    struct security_hash_io* hash_io;
     struct bio* bio = io->bio;
     struct bio* clone;
+    size_t offset = sector >> (s->data_block_bits - SECTOR_SHIFT);
+    size_t count = bio->bi_size >> s->data_block_bits;
 
     pr_info("ksecurityd_io_read: io->sector = %lu\n", io->sector);
 
@@ -423,16 +391,19 @@ int ksecurityd_io_read(struct dm_security_io* io, gfp_t gfp) {
         return 0;
     }
 
+    hash_io = security_hash_io_alloc(s, offset, count);
+
+    security_io_bind(io, hash_io);
+
     pr_info("ksecurityd_io_read: prefetch hash_leaves, hash_io->offset = %lu\n",
-            io->hash_io->offset);
-    security_prefetch_hash_leaves(io->hash_io);
+            hash_io->offset);
+    security_prefetch_hash_leaves(hash_io);
 
     /*
      * The block layer might modify the bvec array, so always
      * copy the required bvecs because we need the original
      * one in order to decrypt the whole bio data *afterwards*.
      */
-    pr_info("ksecurityd_io_read: bio_clone_bioset\n");
     clone = bio_clone_bioset(bio, gfp, s->bs);
     if (!clone)
         return 1;
@@ -529,6 +500,8 @@ void ksecurityd_security_write_convert(struct dm_security_io* io) {
     security_inc_pending(io);
     security_convert_init(s, &io->ctx, NULL, io->bio, hash_bio, sector);
     pr_info("ksecurityd_security_write_convert: 1\n");
+    print_bio(io->bio);
+    msleep(1000);
 
     /*
      * The allocated buffers can be smaller than the whole bio,
@@ -538,6 +511,8 @@ void ksecurityd_security_write_convert(struct dm_security_io* io) {
         pr_info("ksecurityd_security_write_convert: 2\n");
         /* clone bio and alloc new pages so as not to modify orignal data */
         clone = security_alloc_buffer(io, remaining, &out_of_pages);
+        print_bio(clone);
+        msleep(1000);
         if (unlikely(!clone)) {
             pr_info("ksecurityd_security_write_convert: 3\n");
             io->error = -ENOMEM;
@@ -554,9 +529,14 @@ void ksecurityd_security_write_convert(struct dm_security_io* io) {
         security_inc_pending(io);
 
         pr_info("ksecurityd_security_write_convert: 5\n");
-        r = security_convert(s, &io->ctx);
-        if (r < 0)
-            io->error = -EIO;
+        r = 0;
+        msleep(1000);
+        print_convert_context(&io->ctx);
+        msleep(1000);
+
+        // r = security_convert(s, &io->ctx);
+        // if (r < 0)
+        //     io->error = -EIO;
 
         pr_info("ksecurityd_security_write_convert: 6\n");
         security_finished = atomic_dec_and_test(&io->ctx.s_pending);
@@ -566,7 +546,6 @@ void ksecurityd_security_write_convert(struct dm_security_io* io) {
         pr_info("ksecurityd_security_write_convert: 7\n");
         if (security_finished) {
             pr_info("ksecurityd_security_write_convert: security finished\n");
-            // ksecurityd_security_write_io_submit(io, 0);
             ksecurityd_queue_hash(hash_io);
 
             /*
@@ -597,7 +576,7 @@ void ksecurityd_security_write_convert(struct dm_security_io* io) {
             pr_info("ksecurityd_security_write_convert: 11\n");
             new_io = security_io_alloc(io->s, io->bio, sector);
             security_inc_pending(new_io);
-            security_convert_init(s, &new_io->ctx, NULL, io->bio, io->hash_bio,
+            security_convert_init(s, &new_io->ctx, NULL, io->bio, hash_bio,
                                   sector);
             new_io->ctx.idx_in = io->ctx.idx_in;
             new_io->ctx.idx_tag = io->ctx.idx_tag;
