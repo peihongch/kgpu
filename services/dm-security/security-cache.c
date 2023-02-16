@@ -445,9 +445,8 @@ int security_cache_transfer(void* data) {
     struct dm_security_io* io = NULL;
     struct security_hash_io* hash_io = NULL;
     struct bio* bio = NULL;
-    block_t blocks = io->bio->bi_size >> s->data_block_bits;
-    size_t offset = bio->bi_sector >> (s->data_block_bits - SECTOR_SHIFT);
-    size_t count = bio->bi_size >> s->data_block_bits;
+    block_t blocks;
+    size_t offset, count;
     int ret;
 
     DMINFO("Security cache transferer started (pid %d)", current->pid);
@@ -492,6 +491,10 @@ int security_cache_transfer(void* data) {
          * 3. Prefetch hash leaves and do security convertion at the same
          * time
          */
+
+        blocks = io->bio->bi_size >> s->data_block_bits;
+        offset = io->bio->bi_sector >> (s->data_block_bits - SECTOR_SHIFT);
+        count = io->bio->bi_size >> s->data_block_bits;
 
         bio = bio_alloc_bioset(GFP_NOIO, blocks, s->bs);
         if (!bio) {

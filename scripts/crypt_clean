@@ -1,4 +1,0 @@
-#!/bin/sh
-
-dmsetup remove crypt1
-rmmod dm_crypt

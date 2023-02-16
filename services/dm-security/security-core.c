@@ -1012,6 +1012,7 @@ static int security_map(struct dm_target* ti, struct bio* bio) {
     struct dm_security* s = ti->private;
 
     pr_info("security_map: 1\n");
+
     /*
      * If bio is REQ_FLUSH or REQ_DISCARD, just bypass crypt queues.
      * - for REQ_FLUSH device-mapper core ensures that no IO is in-flight

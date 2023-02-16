@@ -1,4 +1,4 @@
-SUBDIRS = libsrv_gaes gxts gauthenc inc-hash
+SUBDIRS = libsrv_gaes gauthenc inc-hash
 # SUBDIRS = callaes libsrv_gaes gauthenc ghmac gecb gctr gxts
 
 all: $(SUBDIRS)

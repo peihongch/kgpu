@@ -2,6 +2,5 @@
 
 rmmod inc_hash && \
 rmmod gauthenc && \
-rmmod gxts && \
 rmmod kgpu && \
 rmmod trusted_storage

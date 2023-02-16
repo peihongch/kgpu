@@ -1,4 +1,4 @@
-SUBDIRS = crypto trusted-storage dm-security dm-crypt
+SUBDIRS = crypto trusted-storage dm-security
 # SUBDIRS = crypto dm-security ecryptfs raid6 test
 
 all: $(SUBDIRS)

@@ -2,7 +2,6 @@
 
 insmod ./trusted-storage.ko && \
     insmod ./kgpu.ko && \
-    insmod ./gxts.ko && \
     insmod ./gauthenc.ko && \
     insmod ./inc-hash.ko && \
     ./helper -l `pwd`
