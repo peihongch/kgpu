@@ -406,9 +406,11 @@ void security_cache_endio(struct bio* bio, int error) {
     struct data_blocks_cache* cache = &s->data_blocks_cache;
     struct security_data_block* block = NULL;
     sector_t start = io->sector;
-    block_t blocks = bio->bi_vcnt;
+    block_t i, blocks = bio->bi_vcnt,
+               step = 1 << (s->data_block_bits - SECTOR_SHIFT);
+    int rw = bio_data_dir(bio);
 
-    if (unlikely(!bio_flagged(clone, BIO_UPTODATE) && !error))
+    if (unlikely(!bio_flagged(bio, BIO_UPTODATE) && !error))
         error = -EIO;
 
     if (rw == WRITE) {
@@ -440,9 +442,12 @@ int security_cache_transfer(void* data) {
     struct dm_security* s =
         container_of(sht, struct dm_security, cache_transferer);
     struct cache_transfer_item* item = NULL;
-    struct dm_security_io *io = NULL, *new_io = NULL;
+    struct dm_security_io* io = NULL;
+    struct security_hash_io* hash_io = NULL;
     struct bio* bio = NULL;
     block_t blocks = io->bio->bi_size >> s->data_block_bits;
+    size_t offset = bio->bi_sector >> (s->data_block_bits - SECTOR_SHIFT);
+    size_t count = bio->bi_size >> s->data_block_bits;
     int ret;
 
     DMINFO("Security cache transferer started (pid %d)", current->pid);
@@ -509,7 +514,7 @@ int security_cache_transfer(void* data) {
         ksecurityd_queue_security(io);
 
         /* 4. Go ahead processing */
-        ksecurityd_security_write_io_submit(io);
+        ksecurityd_security_write_io_submit(io, 0);
 
         kfree(item);
         pr_info("security_cache_transfer: 9\n");

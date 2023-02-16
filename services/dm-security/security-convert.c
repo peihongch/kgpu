@@ -234,6 +234,7 @@ int security_convert(struct dm_security* s, struct convert_context* ctx) {
  */
 void security_endio(struct bio* clone, int error) {
     struct dm_security_io* io = clone->bi_private;
+    struct dm_security* s = io->s;
     struct security_hash_io* hash_io = io->hash_io;
     unsigned rw = bio_data_dir(clone);
 
@@ -375,7 +376,7 @@ int ksecurityd_io_read(struct dm_security_io* io, gfp_t gfp) {
     struct security_hash_io* hash_io;
     struct bio* bio = io->bio;
     struct bio* clone;
-    size_t offset = sector >> (s->data_block_bits - SECTOR_SHIFT);
+    size_t offset = bio->bi_sector >> (s->data_block_bits - SECTOR_SHIFT);
     size_t count = bio->bi_size >> s->data_block_bits;
 
     pr_info("ksecurityd_io_read: io->sector = %lu\n", io->sector);
