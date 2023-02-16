@@ -517,7 +517,7 @@ int security_cache_transfer(void* data) {
         ksecurityd_queue_security(io);
 
         /* 4. Go ahead processing */
-        ksecurityd_security_write_io_submit(io, 0);
+        bio_endio(io->bio, 0);
 
         kfree(item);
         pr_info("security_cache_transfer: 9\n");

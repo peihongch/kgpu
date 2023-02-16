@@ -535,18 +535,21 @@ void ksecurityd_security_write_convert(struct dm_security_io* io) {
         print_convert_context(&io->ctx);
         msleep(1000);
 
-        // r = security_convert(s, &io->ctx);
-        // if (r < 0)
-        //     io->error = -EIO;
+        r = security_convert(s, &io->ctx);
+        if (r < 0)
+            io->error = -EIO;
 
         pr_info("ksecurityd_security_write_convert: 6\n");
         security_finished = atomic_dec_and_test(&io->ctx.s_pending);
 
         /* sync */
         /* Encryption was already finished, submit io now */
-        pr_info("ksecurityd_security_write_convert: 7\n");
+        pr_info(
+            "ksecurityd_security_write_convert: 7, security_finished = %d\n",
+            security_finished);
         if (security_finished) {
             pr_info("ksecurityd_security_write_convert: security finished\n");
+
             ksecurityd_queue_hash(hash_io);
 
             /*
