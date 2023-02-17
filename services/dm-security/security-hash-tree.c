@@ -173,16 +173,12 @@ int security_prefetch_hash_leaves(struct security_hash_io* io) {
     size_t start, count;
     int ret = 0;
 
-    pr_info("security_prefetch_hash_leaves: offset = %lu, count = %lu\n",
-            io->offset, io->count);
     item = kmalloc(sizeof(struct hash_prefetch_item), GFP_NOIO);
     if (!item) {
-        pr_info("security_prefetch_hash_leaves: 1\n");
         ret = -ENOMEM;
         goto out;
     }
 
-    pr_info("security_prefetch_hash_leaves: 2\n");
     start = UMASK_BITS(io->offset, s->leaves_per_node_bits);
     if (UMASK_BITS(io->offset + io->count, s->leaves_per_node_bits) == start)
         count = leaves_per_node;
@@ -190,25 +186,17 @@ int security_prefetch_hash_leaves(struct security_hash_io* io) {
         count =
             DIV_ROUND_UP_BITS(io->offset + io->count - start, leaves_per_node);
 
-    pr_info(
-        "security_prefetch_hash_leaves: init_hash_prefetch_item, start = %lu, "
-        "count = %lu\n",
-        start, count);
-
     init_hash_prefetch_item(item, start, count);
     list_add_tail(&io->list, &item->wait_list);
 
-    pr_info("security_prefetch_hash_leaves: 3\n");
     mutex_lock(&prefetcher->pre_queue_lock);
     list_add_tail_rcu(&item->list, &prefetcher->pre_queue);
     synchronize_rcu();
     mutex_unlock(&prefetcher->pre_queue_lock);
 
-    pr_info("security_prefetch_hash_leaves: 4\n");
     complete(&prefetcher->pre_wait);
 
 out:
-    pr_info("security_prefetch_hash_leaves: 5\n");
     return ret;
 }
 
@@ -223,13 +211,7 @@ void security_hash_endio(struct bio* bio, int error) {
     if (unlikely(!bio_flagged(bio, BIO_UPTODATE) && !error))
         error = -EIO;
 
-    pr_info(
-        "security_hash_endio: bio->bi_sector: %lu, bio->bi_size: %u, "
-        "io->offset: %lu, io->count = %lu, error: %d\n",
-        bio->bi_sector, bio->bi_size, io->offset, io->count, error);
-
     if (rw == WRITE && !error) {
-        pr_info("security_hash_endio: 1\n");
         for (i = io->offset; i < io->count + io->offset; i++) {
             ln = leaf_node_of_block(s, i);
             mutex_lock(&ln->lock);
@@ -245,20 +227,14 @@ void security_hash_endio(struct bio* bio, int error) {
         bio_put(bio);
     }
 
-    pr_info("security_hash_endio: 2\n");
-
     /* queue hash io to verify leaf node using related mediate node */
     if (rw == READ && !error) {
         ksecurityd_queue_hash(io);
         return;
     }
 
-    pr_info("security_hash_endio: 3\n");
-
     if (unlikely(error))
         io->error = error;
-
-    pr_info("security_hash_endio: io->error = %d\n", io->error);
 }
 
 void hash_bio_init(struct security_hash_io* io, struct bio* bio) {
@@ -280,17 +256,12 @@ int security_hash_alloc_buffer(struct security_hash_io* io) {
     struct page* page;
     int ret = 0;
 
-    pr_info("security_hash_alloc_buffer: size=%lu, nr_iovecs=%lu\n", size,
-            nr_iovecs);
-
 retry:
     if (unlikely(out_of_pages))
         mutex_lock(&s->bio_alloc_lock);
 
-    pr_info("security_hash_alloc_buffer: 1\n");
     bio = bio_alloc_bioset(GFP_NOIO, nr_iovecs, s->bs);
     if (!bio) {
-        pr_info("security_hash_alloc_buffer: 2\n");
         ret = -ENOMEM;
         goto out;
     }
@@ -300,11 +271,9 @@ retry:
 
     remaining_size = size;
 
-    pr_info("security_hash_alloc_buffer: 3\n");
     for (i = 0; i < nr_iovecs; i++) {
         page = mempool_alloc(s->page_pool, gfp_mask);
         if (!page) {
-            pr_info("security_hash_alloc_buffer: 4\n");
             security_free_buffer_pages(s, bio);
             bio_put(bio);
             out_of_pages = true;
@@ -314,24 +283,20 @@ retry:
         len = min(remaining_size, (unsigned)PAGE_SIZE);
 
         if (!bio_add_page(bio, page, len, 0)) {
-            pr_info("security_hash_alloc_buffer: 5\n");
             security_free_buffer_pages(s, bio);
             bio_put(bio);
             goto retry;
         }
 
         remaining_size -= len;
-        pr_info("security_hash_alloc_buffer: 6\n");
     }
 
     ret = 0;
 out:
-    pr_info("security_hash_alloc_buffer: 7\n");
     if (unlikely(out_of_pages)) {
         mutex_unlock(&s->bio_alloc_lock);
     }
 
-    pr_info("security_hash_alloc_buffer: 8\n");
     return ret;
 }
 
@@ -391,11 +356,6 @@ int ksecurityd_hash_io_read(struct security_hash_io* io, gfp_t gfp) {
     bio->bi_sector = security_map_hash_sector(
         s, io->offset >> (SECTOR_SHIFT - s->hash_node_bits));
 
-    pr_info(
-        "ksecurityd_hash_io_read: bio->bi_sector=%lu, bio->bi_size = %u, "
-        "io->offset=%lu, io->count=%lu\n",
-        bio->bi_sector, bio->bi_size, io->offset, io->count);
-
     generic_make_request(bio);
     return 0;
 }
@@ -413,12 +373,6 @@ void ksecurityd_hash_io_write(struct security_hash_io* io) {
 void ksecurityd_hash_io(struct work_struct* work) {
     struct security_hash_io* io =
         container_of(work, struct security_hash_io, work);
-
-    pr_info(
-        "ksecurityd_hash_io: 1, rw = %s, bio->bi_sector = %lu, bio->bi_size = "
-        "%u\n",
-        bio_data_dir(io->bio) == READ ? "READ" : "WRITE", io->bio->bi_sector,
-        io->bio->bi_size);
 
     if (bio_data_dir(io->bio) == READ) {
         if (ksecurityd_hash_io_read(io, GFP_NOIO))
@@ -453,12 +407,8 @@ void ksecurityd_hash_write_convert(struct security_hash_io* io) {
     u8 root_delta[AUTHSIZE] = {0};
     unsigned i, j, len, offset, ret = 0;
 
-    pr_info("ksecurityd_hash_write_convert: 1, io = %p\n", io);
-    msleep(1000);
-
     ctx = kmalloc(sizeof(struct inc_hash_ctx) + digest_size * 2, GFP_NOIO);
     if (!ctx) {
-        pr_info("ksecurityd_hash_write_convert: 1.1\n");
         io->error = -ENOMEM;
         goto out;
     }
@@ -468,11 +418,7 @@ void ksecurityd_hash_write_convert(struct security_hash_io* io) {
      * Wait for leaf nodes to be fetched into cache,
      * so that we can update mediate nodes using inc hash algo.
      */
-    pr_info("ksecurityd_hash_write_convert: 2\n");
     wait_for_completion(&io->restart);
-
-    pr_info("ksecurityd_hash_write_convert: 3\n");
-    msleep(1000);
 
     j = 0;
     INIT_LIST_HEAD(&delta_list);
@@ -480,12 +426,9 @@ void ksecurityd_hash_write_convert(struct security_hash_io* io) {
         page = bvec->bv_page;
         len = bvec->bv_len;
         offset = bvec->bv_offset;
-        pr_info("ksecurityd_hash_write_convert: 4\n");
         while (j < io->count && offset < len) {
-            pr_info("ksecurityd_hash_write_convert: 5\n");
             tmp = mediate_node_of_block(s, io->offset + j);
             if (tmp != mn) {
-                pr_info("ksecurityd_hash_write_convert: 6\n");
                 mn = tmp;
                 hash_delta =
                     kzalloc(sizeof(struct mediate_node_hash_delta), GFP_NOIO);
@@ -494,30 +437,22 @@ void ksecurityd_hash_write_convert(struct security_hash_io* io) {
                 list_add_tail(&hash_delta->list, &delta_list);
             }
 
-            pr_info("ksecurityd_hash_write_convert: 7\n");
             BUG_ON(!mn->leaves);
             ln = mn->leaves[MASK_BITS(io->offset + i, s->leaves_per_node_bits)];
             /* defer mutex_unlock to io completion */
             mutex_lock(&ln->lock);
 
-            pr_info("ksecurityd_hash_write_convert: 8\n");
             ctx->id = ln->index;
             memcpy(ctx->data, ln->digest, digest_size);
-            pr_info("ksecurityd_hash_write_convert: 9\n");
             memcpy(ln->digest, page_address(page) + offset, digest_size);
-            pr_info("ksecurityd_hash_write_convert: 10\n");
             memcpy(ctx->data + digest_size, ln->digest, digest_size);
 
-            pr_info("ksecurityd_hash_write_convert: 11\n");
             crypto_shash_digest(s->hash_desc, (const u8*)ctx, digest_size,
                                 hash_delta->digest);
 
-            pr_info("ksecurityd_hash_write_convert: 12\n");
             offset += digest_size;
             j++;
         }
-
-        pr_info("ksecurityd_hash_write_convert: 13\n");
     }
 
     /**
@@ -525,60 +460,45 @@ void ksecurityd_hash_write_convert(struct security_hash_io* io) {
      * so that different leaf nodes can be updated concurrently and won't block
      * each other.
      */
-    pr_info("ksecurityd_hash_write_convert: 14\n");
     list_for_each_entry_safe(hash_delta, tmp_delta, &delta_list, list) {
         mn = s->mediate_nodes[hash_delta->index];
         /* defer mutex_unlock to io completion */
         mutex_lock(&mn->lock);
 
-        pr_info("ksecurityd_hash_write_convert: 15\n");
         memcpy(ctx->data, mn->digest, digest_size);
-        pr_info("ksecurityd_hash_write_convert: 16\n");
         crypto_xor(mn->digest, hash_delta->digest, digest_size);
-        pr_info("ksecurityd_hash_write_convert: 17\n");
         memcpy(ctx->data + digest_size, mn->digest, digest_size);
         ctx->id = mn->index;
 
-        pr_info("ksecurityd_hash_write_convert: 18\n");
         crypto_shash_digest(s->hash_desc, (const u8*)ctx, digest_size,
                             root_delta);
-        pr_info("ksecurityd_hash_write_convert: 19\n");
     }
 
-    pr_info("ksecurityd_hash_write_convert: 20\n");
     mutex_lock(&s->root_hash_lock);
 
     crypto_xor(s->root_hash, root_delta, digest_size);
-    pr_info("ksecurityd_hash_write_convert: 21\n");
     ret = trusted_storage_write(s->root_hash_key, s->root_hash, digest_size);
-    pr_info("ksecurityd_hash_write_convert: 22, ret = %d\n", ret);
     if (ret) {
         DMERR("failed to write root hash to trusted storage");
         goto out;
     }
 
-    pr_info("ksecurityd_hash_write_convert: 23\n");
     init_completion(&io->restart);
     ksecurityd_security_write_io_submit(base_io, 0);
-    pr_info("ksecurityd_hash_write_convert: 24\n");
     wait_for_completion(&io->restart);
 
 out:
 
-    pr_info("ksecurityd_hash_write_convert: 25\n");
     mutex_unlock(&s->root_hash_lock);
 
     list_for_each_entry_safe(hash_delta, tmp_delta, &delta_list, list) {
-        pr_info("ksecurityd_hash_write_convert: 26\n");
         mn = s->mediate_nodes[hash_delta->index];
         mutex_unlock(&mn->lock);
         list_del(&hash_delta->list);
         kfree(hash_delta);
     }
 
-    pr_info("ksecurityd_hash_write_convert: 27\n");
     for (i = 0; i < io->count; i++) {
-        pr_info("ksecurityd_hash_write_convert: 28\n");
         mn = mediate_node_of_block(s, io->offset + i);
         ln = mn->leaves[MASK_BITS(io->offset + i, s->leaves_per_node_bits)];
         ln->verified = true;
@@ -586,11 +506,8 @@ out:
         mutex_unlock(&ln->lock);
     }
 
-    pr_info("ksecurityd_hash_write_convert: 29\n");
     if (ctx)
         kfree(ctx);
-
-    pr_info("ksecurityd_hash_write_convert: 30\n");
 }
 
 bool security_leaves_cache_is_empty(struct dm_security* s) {
@@ -659,7 +576,6 @@ out:
     return leaves;
 
 nomem:
-    pr_info("security_leaves_cache_alloc: nomem\n");
     for (i = 0; i < leaves_per_node; i++) {
         if (!leaves[i])
             break;
@@ -850,13 +766,10 @@ int security_hash_flush(void* data) {
         init_completion(&sht->wait);
         wait_for_completion_timeout(&sht->wait, HASH_FLUSH_TIMEOUT);
 
-        // pr_info("security_hash_flush: 1\n");
-
         mutex_lock(&sht->queue_lock);
 
         /* Exit prefetch thread */
         if (kthread_should_stop() && list_empty(&sht->queue)) {
-            pr_info("security_hash_flush: 2\n");
             sht->stopped = true;
             mutex_unlock(&sht->queue_lock);
             ret = 0;
@@ -868,11 +781,9 @@ int security_hash_flush(void* data) {
         ln = list_first_entry_or_null(&sht->queue, struct security_leaf_node,
                                       flush_list);
         if (!ln) {
-            // pr_info("security_hash_flush: 3\n");
             mutex_unlock(&sht->queue_lock);
             continue;
         }
-        pr_info("security_hash_flush: 4\n");
 
         /* 2. Walk through hash rbtree to get adjacent items */
 
@@ -881,7 +792,6 @@ int security_hash_flush(void* data) {
         start = &ln->flush_rb_node;
         end = rb_next(&ln->flush_rb_node);
         for (node = &ln->flush_rb_node; node; node = rb_prev(node)) {
-            pr_info("security_hash_flush: 5\n");
             tmp = rb_entry(node, struct security_leaf_node, flush_rb_node);
             if (tmp->index != index)
                 break;
@@ -891,7 +801,6 @@ int security_hash_flush(void* data) {
         /* Traverse right side of leaf node */
         index = ln->index;
         for (node = &ln->flush_rb_node; node; node = rb_next(node)) {
-            pr_info("security_hash_flush: 6\n");
             tmp = rb_entry(node, struct security_leaf_node, flush_rb_node);
             index = tmp->index;
             if (tmp->index != index) {
@@ -903,48 +812,38 @@ int security_hash_flush(void* data) {
 
         /* 3. Remove all adjacent items from both queue and rbtree */
 
-        pr_info("security_hash_flush: 7\n");
-
         count = index - offset;
         io = security_hash_io_alloc(s, offset, count);
         bio = bio_alloc_bioset(GFP_NOIO, count, s->bs);
         if (!bio) {
-            pr_info("security_hash_flush: 8\n");
             ret = -ENOMEM;
             mutex_unlock(&sht->queue_lock);
             goto nomem;
         }
         hash_bio_init(io, bio);
 
-        pr_info("security_hash_flush: 9\n");
         for (node = start; node != end; node = rb_next(node)) {
-            pr_info("security_hash_flush: 10\n");
             ln = rb_entry(node, struct security_leaf_node, flush_rb_node);
 
             rb_erase(node, &sht->rbtree_root);
             list_del(&ln->flush_list);
 
-            pr_info("security_hash_flush: 11\n");
             bio_add_page(bio, virt_to_page(ln->digest), sizeof(ln->digest),
                          offset_in_page(ln->digest));
         }
 
         /* 4. Go ahead process */
 
-        pr_info("security_hash_flush: 12\n");
         bio->bi_rw |= WRITE;
         io->bio = bio;
         ksecurityd_hash_queue_io(io);
 
-        pr_info("security_hash_flush: 13\n");
         mutex_unlock(&sht->queue_lock);
     }
 
-    pr_info("security_hash_flush: 14\n");
     ret = 0;
 
 nomem:
-    pr_info("security_hash_flush: 15\n");
     if (io)
         security_hash_io_free(io);
 out:

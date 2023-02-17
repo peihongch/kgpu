@@ -9,5 +9,6 @@ dmsetup create security1 --table "0 `blockdev --getsz $1` security 123456789abcd
 # badblocks -s -w -v /dev/mapper/security1
 
 # mkfs.btrfs /dev/mapper/security1 -f
-# mkdir -p mnt
-# mount /dev/mapper/security1 mnt
+mkfs.ext4 /dev/mapper/security1
+mkdir -p mnt
+mount /dev/mapper/security1 mnt

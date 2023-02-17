@@ -1015,15 +1015,12 @@ static int security_map(struct dm_target* ti, struct bio* bio) {
     struct dm_security_io* io;
     struct dm_security* s = ti->private;
 
-    pr_info("security_map: 1\n");
-
     /*
      * If bio is REQ_FLUSH or REQ_DISCARD, just bypass crypt queues.
      * - for REQ_FLUSH device-mapper core ensures that no IO is in-flight
      * - for REQ_DISCARD caller must use flush if IO ordering matters
      */
     if (unlikely(bio->bi_rw & (REQ_FLUSH | REQ_DISCARD))) {
-        pr_info("security_map: 2\n");
         bio->bi_bdev = s->dev->bdev;
         if (bio_sectors(bio))
             bio->bi_sector = security_map_data_sector(s, bio->bi_sector);
@@ -1031,24 +1028,14 @@ static int security_map(struct dm_target* ti, struct bio* bio) {
     }
 
     io = security_io_alloc(s, bio, dm_target_offset(ti, bio->bi_sector));
-    pr_info(
-        "security_map: 3, rw = %s, bio->bi_sector = %lu, bio->bi_size = %u, "
-        "dm_target_offset = %u, io->sector = %lu\n",
-        bio->bi_rw == READ ? "READ" : "WRITE", bio->bi_sector, bio->bi_size,
-        dm_target_offset(ti, bio->bi_sector), io->sector);
 
     if (bio_data_dir(io->bio) == READ) {
-        pr_info("security_map: 4\n");
-        if (ksecurityd_io_read(io, GFP_NOWAIT)) {
-            pr_info("security_map: 5\n");
+        if (ksecurityd_io_read(io, GFP_NOWAIT))
             ksecurityd_queue_io(io);
-        }
     } else {
-        pr_info("security_map: 6\n");
         security_queue_cache(io);
     }
 
-    pr_info("security_map: 7\n");
     return DM_MAPIO_SUBMITTED;
 }
 
