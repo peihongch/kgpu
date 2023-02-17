@@ -154,7 +154,6 @@ struct hash_update_item {
 struct cache_transfer_item {
     struct list_head list;     /* list_head for transfer queue */
     struct dm_security_io* io; /* io to transfer */
-    struct mutex lock;         /* lock for cache transfer item */
 };
 
 /*

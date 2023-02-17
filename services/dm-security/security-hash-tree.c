@@ -414,6 +414,12 @@ void ksecurityd_hash_io(struct work_struct* work) {
     struct security_hash_io* io =
         container_of(work, struct security_hash_io, work);
 
+    pr_info(
+        "ksecurityd_hash_io: 1, rw = %s, bio->bi_sector = %lu, bio->bi_size = "
+        "%u\n",
+        bio_data_dir(io->bio) == READ ? "READ" : "WRITE", io->bio->bi_sector,
+        io->bio->bi_size);
+
     if (bio_data_dir(io->bio) == READ) {
         if (ksecurityd_hash_io_read(io, GFP_NOIO))
             io->error = -ENOMEM;
@@ -447,8 +453,12 @@ void ksecurityd_hash_write_convert(struct security_hash_io* io) {
     u8 root_delta[AUTHSIZE] = {0};
     unsigned i, j, len, offset, ret = 0;
 
+    pr_info("ksecurityd_hash_write_convert: 1, io = %p\n", io);
+    msleep(1000);
+
     ctx = kmalloc(sizeof(struct inc_hash_ctx) + digest_size * 2, GFP_NOIO);
     if (!ctx) {
+        pr_info("ksecurityd_hash_write_convert: 1.1\n");
         io->error = -ENOMEM;
         goto out;
     }
@@ -458,16 +468,24 @@ void ksecurityd_hash_write_convert(struct security_hash_io* io) {
      * Wait for leaf nodes to be fetched into cache,
      * so that we can update mediate nodes using inc hash algo.
      */
+    pr_info("ksecurityd_hash_write_convert: 2\n");
     wait_for_completion(&io->restart);
 
+    pr_info("ksecurityd_hash_write_convert: 3\n");
+    msleep(1000);
+
     j = 0;
+    INIT_LIST_HEAD(&delta_list);
     bio_for_each_segment_all(bvec, bio, i) {
         page = bvec->bv_page;
         len = bvec->bv_len;
         offset = bvec->bv_offset;
+        pr_info("ksecurityd_hash_write_convert: 4\n");
         while (j < io->count && offset < len) {
+            pr_info("ksecurityd_hash_write_convert: 5\n");
             tmp = mediate_node_of_block(s, io->offset + j);
             if (tmp != mn) {
+                pr_info("ksecurityd_hash_write_convert: 6\n");
                 mn = tmp;
                 hash_delta =
                     kzalloc(sizeof(struct mediate_node_hash_delta), GFP_NOIO);
@@ -476,22 +494,30 @@ void ksecurityd_hash_write_convert(struct security_hash_io* io) {
                 list_add_tail(&hash_delta->list, &delta_list);
             }
 
+            pr_info("ksecurityd_hash_write_convert: 7\n");
             BUG_ON(!mn->leaves);
             ln = mn->leaves[MASK_BITS(io->offset + i, s->leaves_per_node_bits)];
             /* defer mutex_unlock to io completion */
             mutex_lock(&ln->lock);
 
+            pr_info("ksecurityd_hash_write_convert: 8\n");
             ctx->id = ln->index;
             memcpy(ctx->data, ln->digest, digest_size);
+            pr_info("ksecurityd_hash_write_convert: 9\n");
             memcpy(ln->digest, page_address(page) + offset, digest_size);
+            pr_info("ksecurityd_hash_write_convert: 10\n");
             memcpy(ctx->data + digest_size, ln->digest, digest_size);
 
+            pr_info("ksecurityd_hash_write_convert: 11\n");
             crypto_shash_digest(s->hash_desc, (const u8*)ctx, digest_size,
                                 hash_delta->digest);
 
+            pr_info("ksecurityd_hash_write_convert: 12\n");
             offset += digest_size;
             j++;
         }
+
+        pr_info("ksecurityd_hash_write_convert: 13\n");
     }
 
     /**
@@ -499,45 +525,60 @@ void ksecurityd_hash_write_convert(struct security_hash_io* io) {
      * so that different leaf nodes can be updated concurrently and won't block
      * each other.
      */
+    pr_info("ksecurityd_hash_write_convert: 14\n");
     list_for_each_entry_safe(hash_delta, tmp_delta, &delta_list, list) {
         mn = s->mediate_nodes[hash_delta->index];
         /* defer mutex_unlock to io completion */
         mutex_lock(&mn->lock);
 
+        pr_info("ksecurityd_hash_write_convert: 15\n");
         memcpy(ctx->data, mn->digest, digest_size);
+        pr_info("ksecurityd_hash_write_convert: 16\n");
         crypto_xor(mn->digest, hash_delta->digest, digest_size);
+        pr_info("ksecurityd_hash_write_convert: 17\n");
         memcpy(ctx->data + digest_size, mn->digest, digest_size);
         ctx->id = mn->index;
 
+        pr_info("ksecurityd_hash_write_convert: 18\n");
         crypto_shash_digest(s->hash_desc, (const u8*)ctx, digest_size,
                             root_delta);
+        pr_info("ksecurityd_hash_write_convert: 19\n");
     }
 
+    pr_info("ksecurityd_hash_write_convert: 20\n");
     mutex_lock(&s->root_hash_lock);
 
     crypto_xor(s->root_hash, root_delta, digest_size);
+    pr_info("ksecurityd_hash_write_convert: 21\n");
     ret = trusted_storage_write(s->root_hash_key, s->root_hash, digest_size);
+    pr_info("ksecurityd_hash_write_convert: 22, ret = %d\n", ret);
     if (ret) {
         DMERR("failed to write root hash to trusted storage");
         goto out;
     }
 
+    pr_info("ksecurityd_hash_write_convert: 23\n");
     init_completion(&io->restart);
     ksecurityd_security_write_io_submit(base_io, 0);
+    pr_info("ksecurityd_hash_write_convert: 24\n");
     wait_for_completion(&io->restart);
 
 out:
 
+    pr_info("ksecurityd_hash_write_convert: 25\n");
     mutex_unlock(&s->root_hash_lock);
 
     list_for_each_entry_safe(hash_delta, tmp_delta, &delta_list, list) {
+        pr_info("ksecurityd_hash_write_convert: 26\n");
         mn = s->mediate_nodes[hash_delta->index];
         mutex_unlock(&mn->lock);
         list_del(&hash_delta->list);
         kfree(hash_delta);
     }
 
+    pr_info("ksecurityd_hash_write_convert: 27\n");
     for (i = 0; i < io->count; i++) {
+        pr_info("ksecurityd_hash_write_convert: 28\n");
         mn = mediate_node_of_block(s, io->offset + i);
         ln = mn->leaves[MASK_BITS(io->offset + i, s->leaves_per_node_bits)];
         ln->verified = true;
@@ -545,8 +586,11 @@ out:
         mutex_unlock(&ln->lock);
     }
 
+    pr_info("ksecurityd_hash_write_convert: 29\n");
     if (ctx)
         kfree(ctx);
+
+    pr_info("ksecurityd_hash_write_convert: 30\n");
 }
 
 bool security_leaves_cache_is_empty(struct dm_security* s) {

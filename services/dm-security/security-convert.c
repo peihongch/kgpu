@@ -161,8 +161,8 @@ int security_convert(struct dm_security* s, struct convert_context* ctx) {
     atomic_set(&ctx->s_pending, 1);
 
     while (ctx->idx_in < ctx->bio_in->bi_vcnt &&
-           ctx->idx_tag < ctx->bio_tag->bi_vcnt &&
-           ctx->idx_out < ctx->bio_out->bi_vcnt) {
+           ctx->idx_out < ctx->bio_out->bi_vcnt &&
+           ctx->idx_tag < ctx->bio_tag->bi_vcnt) {
         security_alloc_req(s, ctx);
 
         atomic_inc(&ctx->s_pending);
@@ -501,8 +501,6 @@ void ksecurityd_security_write_convert(struct dm_security_io* io) {
     security_inc_pending(io);
     security_convert_init(s, &io->ctx, NULL, io->bio, hash_bio, sector);
     pr_info("ksecurityd_security_write_convert: 1\n");
-    print_bio(io->bio);
-    msleep(1000);
 
     /*
      * The allocated buffers can be smaller than the whole bio,
@@ -512,8 +510,6 @@ void ksecurityd_security_write_convert(struct dm_security_io* io) {
         pr_info("ksecurityd_security_write_convert: 2\n");
         /* clone bio and alloc new pages so as not to modify orignal data */
         clone = security_alloc_buffer(io, remaining, &out_of_pages);
-        print_bio(clone);
-        msleep(1000);
         if (unlikely(!clone)) {
             pr_info("ksecurityd_security_write_convert: 3\n");
             io->error = -ENOMEM;
@@ -530,16 +526,14 @@ void ksecurityd_security_write_convert(struct dm_security_io* io) {
         security_inc_pending(io);
 
         pr_info("ksecurityd_security_write_convert: 5\n");
-        r = 0;
-        msleep(1000);
         print_convert_context(&io->ctx);
-        msleep(1000);
 
         r = security_convert(s, &io->ctx);
         if (r < 0)
             io->error = -EIO;
+        // r = 0;
 
-        pr_info("ksecurityd_security_write_convert: 6\n");
+        pr_info("ksecurityd_security_write_convert: 6, r = %d\n", r);
         security_finished = atomic_dec_and_test(&io->ctx.s_pending);
 
         /* sync */
@@ -750,6 +744,7 @@ void ksecurityd_security(struct work_struct* work) {
 
     /* alloc hash bio to hold generated authentication tags */
     hash_bio = bio_alloc_bioset(GFP_NOIO, nr_iovecs, s->bs);
+    hash_bio->bi_private = hash_io;
     /* NOTE : must set hash_bio->bi_bdev before bio_add_page */
     hash_bio->bi_bdev = s->dev->bdev;
     hash_bio->bi_rw |= bio_data_dir(bio);
@@ -769,7 +764,7 @@ void ksecurityd_security(struct work_struct* work) {
         remainings -= len;
     }
     io->hash_bio = hash_bio;
-    hash_io->base_io = io;
+    hash_io->bio = hash_bio;
 
     pr_info("ksecurityd_security: 5\n");
     if (bio_data_dir(io->bio) == READ)

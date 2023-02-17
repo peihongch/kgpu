@@ -37,11 +37,7 @@ void security_dec_pending(struct dm_security_io* io) {
     if (!atomic_dec_and_test(&io->io_pending))
         return;
 
-    if (io->hash_bio) {
-        security_free_buffer_pages(s, io->hash_bio);
-        bio_put(io->hash_bio);
-        security_hash_io_free(io->hash_io);
-    }
+    security_hash_io_free(io->hash_io);
 
     mempool_free(io, s->io_pool);
 
@@ -53,9 +49,6 @@ void security_dec_pending(struct dm_security_io* io) {
                 base_io->error = error;
             security_dec_pending(base_io);
         }
-    } else {
-        security_free_buffer_pages(s, bio);
-        bio_put(bio);
     }
 }
 

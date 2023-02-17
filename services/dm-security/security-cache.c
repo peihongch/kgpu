@@ -77,24 +77,38 @@ int security_cache_lookup(struct dm_security* s, struct dm_security_io* io) {
     struct bio* bio = io->bio;
     struct bio_vec* bvec;
     void** slot;
-    sector_t sectors = bio->bi_size >> SECTOR_SHIFT;
     sector_t start = bio->bi_sector;
+    sector_t sectors = bio->bi_size >> SECTOR_SHIFT;
     sector_t cur = start;
     sector_t step = 1 << (s->data_block_bits - SECTOR_SHIFT);
     size_t bs = 1 << s->data_block_bits;
     unsigned i, idx, offset, len, ret = 0;
 
+    if (bio_data_dir(bio) == WRITE)
+        pr_info("security_cache_lookup: start=%lu, sectors=%lu\n", start,
+                sectors);
+
     /* Firstly, check if all data blocks in cache */
     idx = offset = 0;
     rcu_read_lock();
+    if (bio_data_dir(bio) == WRITE)
+        pr_info("security_cache_lookup: 1\n");
     radix_tree_for_each_slot(slot, &cache->rt_root, &iter, start) {
+        if (bio_data_dir(bio) == WRITE)
+            pr_info("security_cache_lookup: 2\n");
         block = *slot;
         if ((block->start != cur) || (block->start >= start + sectors))
             break;
         cur += step;
+        if (bio_data_dir(bio) == WRITE)
+            pr_info("security_cache_lookup: 3\n");
     }
+    if (bio_data_dir(bio) == WRITE)
+        pr_info("security_cache_lookup: 4\n");
     rcu_read_unlock();
 
+    if (bio_data_dir(bio) == WRITE)
+        pr_info("security_cache_lookup: 5\n");
     if (cur != start + sectors) {
         ret = -EIO;
         goto out;
@@ -103,22 +117,34 @@ int security_cache_lookup(struct dm_security* s, struct dm_security_io* io) {
     /* Copy cached data to bio if all data blocks exist */
     idx = offset = 0;
     mutex_lock(&cache->lock);
+    if (bio_data_dir(bio) == WRITE)
+        pr_info("security_cache_lookup: 6\n");
     radix_tree_for_each_slot(slot, &cache->rt_root, &iter, start) {
+        if (bio_data_dir(bio) == WRITE)
+            pr_info("security_cache_lookup: 7\n");
         block = *slot;
         if (block->start >= start + sectors)
             break;
 
         /* update lru cache */
+        if (bio_data_dir(bio) == WRITE)
+            pr_info("security_cache_lookup: 8\n");
         list_move_tail(&block->lru_item, &cache->lru_list);
         synchronize_rcu();
 
         /* copy cached data to bio */
         i = bs;
+        if (bio_data_dir(bio) == WRITE)
+            pr_info("security_cache_lookup: 9\n");
         while (i) {
             bvec = bio_iovec_idx(bio, idx);
             len = min(i, bvec->bv_len);
+            if (bio_data_dir(bio) == WRITE)
+                pr_info("security_cache_lookup: 10\n");
             memcpy(page_address(bvec->bv_page) + bvec->bv_offset + offset,
                    block->buf, len);
+            if (bio_data_dir(bio) == WRITE)
+                pr_info("security_cache_lookup: 11\n");
             i -= len;
             offset += len;
             if (offset >= bvec->bv_len) {
@@ -126,10 +152,14 @@ int security_cache_lookup(struct dm_security* s, struct dm_security_io* io) {
                 idx++;
             }
         }
+        if (bio_data_dir(bio) == WRITE)
+            pr_info("security_cache_lookup: 12\n");
     }
     mutex_unlock(&cache->lock);
 
 out:
+    if (bio_data_dir(bio) == WRITE)
+        pr_info("security_cache_lookup: 13\n");
     return ret;
 }
 
@@ -383,11 +413,10 @@ void security_queue_cache(struct dm_security_io* io) {
 
     security_inc_pending(io);
 
-    item = kzalloc(sizeof(*item), GFP_NOIO);
+    item = kzalloc(sizeof(struct cache_transfer_item), GFP_NOIO);
     if (!item)
         return;
     item->io = io;
-    mutex_init(&item->lock);
 
     pr_info("security_queue_cache: 2\n");
     mutex_lock(&sct->queue_lock);
@@ -438,13 +467,13 @@ out:
 }
 
 int security_cache_transfer(void* data) {
-    struct security_cache_task* sht = data;
+    struct security_cache_task* sct = data;
     struct dm_security* s =
-        container_of(sht, struct dm_security, cache_transferer);
+        container_of(sct, struct dm_security, cache_transferer);
     struct cache_transfer_item* item = NULL;
     struct dm_security_io* io = NULL;
     struct security_hash_io* hash_io = NULL;
-    struct bio* bio = NULL;
+    struct bio* bio = NULL, *clone = NULL;
     block_t blocks;
     size_t offset, count;
     int ret;
@@ -452,30 +481,30 @@ int security_cache_transfer(void* data) {
     DMINFO("Security cache transferer started (pid %d)", current->pid);
 
     while (1) {
-        wait_for_completion_timeout(&sht->wait, CACHE_TRANSFER_TIMEOUT);
-        reinit_completion(&sht->wait);
+        wait_for_completion_timeout(&sct->wait, CACHE_TRANSFER_TIMEOUT);
+        reinit_completion(&sct->wait);
 
         rcu_read_lock();
-        if (kthread_should_stop() && list_empty(&sht->queue)) {
+        if (kthread_should_stop() && list_empty(&sct->queue)) {
             rcu_read_unlock();
             /* Exit prefetch thread */
-            sht->stopped = true;
+            sct->stopped = true;
             ret = 0;
             goto out;
         }
 
         /* 1. Get one item from queue */
-        item = list_first_or_null_rcu(&sht->queue, struct cache_transfer_item,
+        item = list_first_or_null_rcu(&sct->queue, struct cache_transfer_item,
                                       list);
         rcu_read_unlock();
         if (!item)
             continue;
 
         pr_info("security_cache_transfer: 1\n");
-        mutex_lock(&item->lock);
+        mutex_lock(&sct->queue_lock);
         list_del_rcu(&item->list);
         synchronize_rcu();
-        mutex_unlock(&item->lock);
+        mutex_unlock(&sct->queue_lock);
 
         /* 2. Insert bio to cache */
         pr_info("security_cache_transfer: 2\n");
@@ -492,21 +521,24 @@ int security_cache_transfer(void* data) {
          * time
          */
 
-        blocks = io->bio->bi_size >> s->data_block_bits;
-        offset = io->bio->bi_sector >> (s->data_block_bits - SECTOR_SHIFT);
-        count = io->bio->bi_size >> s->data_block_bits;
+        bio = io->bio;
 
-        bio = bio_alloc_bioset(GFP_NOIO, blocks, s->bs);
-        if (!bio) {
+        blocks = bio->bi_size >> s->data_block_bits;
+        offset = bio->bi_sector >> (s->data_block_bits - SECTOR_SHIFT);
+        count = bio->bi_size >> s->data_block_bits;
+
+        clone = bio_alloc_bioset(GFP_NOIO, blocks, s->bs);
+        if (!clone) {
             DMERR("Failed to alloc bio");
             goto requeue;
         }
-        bio->bi_private = io;
-        bio->bi_end_io = security_cache_endio;
-        bio->bi_bdev = s->dev->bdev;
-        bio->bi_rw = io->bio->bi_rw;
+        clone->bi_private = io;
+        clone->bi_end_io = security_cache_endio;
+        clone->bi_bdev = s->dev->bdev;
+        clone->bi_rw = bio->bi_rw;
+        io->bio = clone;
 
-        BUG_ON(security_cache_flush_prepare(s, bio, io->sector, blocks));
+        BUG_ON(security_cache_flush_prepare(s, clone, io->sector, blocks));
 
         security_inc_pending(io);
 
@@ -517,7 +549,7 @@ int security_cache_transfer(void* data) {
         ksecurityd_queue_security(io);
 
         /* 4. Go ahead processing */
-        bio_endio(io->bio, 0);
+        bio_endio(bio, 0);
 
         kfree(item);
         pr_info("security_cache_transfer: 9\n");
@@ -525,10 +557,10 @@ int security_cache_transfer(void* data) {
         continue;
 
     requeue:
-        mutex_lock(&sht->queue_lock);
-        list_add_tail_rcu(&item->list, &sht->queue);
+        mutex_lock(&sct->queue_lock);
+        list_add_tail_rcu(&item->list, &sct->queue);
         synchronize_rcu();
-        mutex_unlock(&sht->queue_lock);
+        mutex_unlock(&sct->queue_lock);
     }
 
     pr_info("security_cache_transfer: 10\n");
