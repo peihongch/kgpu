@@ -652,14 +652,14 @@ static int security_ctr_layout(struct dm_target* ti,
         security_super_block_load(s);
 
         /* load root hash from trusted storage (emulator) */
-        saved_root_hash = kzalloc(hash_node_size(s), GFP_KERNEL);
+        saved_root_hash = kzalloc(hash_node_size(s) * 2, GFP_KERNEL);
         if (!saved_root_hash) {
             ti->error = "Cannot allocate saved root hash buffer";
             goto bad;
         }
 
         ret = trusted_storage_read(s->root_hash_key, saved_root_hash,
-                                   hash_node_size(s));
+                                   hash_node_size(s) * 2);
         if (ret) {
             ti->error = "Cannot read saved root hash from trusted storage";
             goto bad;
@@ -741,8 +741,12 @@ out:
 
     if (likely(saved_root_hash)) {
         /* check if root hashes match if not the first time loading */
-        if (memcmp(s->root_hash, saved_root_hash, hash_node_size(s))) {
-            ti->error = "Root hash not match, device data may corrupted";
+        if (memcmp(s->root_hash, saved_root_hash, hash_node_size(s)) &&
+            memcmp(s->root_hash, saved_root_hash + hash_node_size(s),
+                   hash_node_size(s))) {
+            ti->error =
+                "Both root hash and backup root hash not match, device data "
+                "may corrupted";
             ret = -EINVAL;
             goto bad;
         }

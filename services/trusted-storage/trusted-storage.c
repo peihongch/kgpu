@@ -1,3 +1,4 @@
+#include <linux/delay.h>
 #include <linux/fs.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
@@ -5,6 +6,7 @@
 #include <linux/mutex.h>
 #include <linux/proc_fs.h>
 #include <linux/radix-tree.h>
+#include <linux/rcupdate.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 
@@ -36,9 +38,14 @@ struct trusted_storage {
     struct radix_tree_root root;
     struct proc_dir_entry* proc_dir;
     struct mutex lock;
-    size_t max_buf_size;
     size_t size;
     bool stopped;
+};
+
+struct trusted_storage_entry {
+    void* buf;
+    void* bak_buf;
+    size_t len;
 };
 
 /***************** External Functions *******************/
@@ -81,7 +88,6 @@ static struct trusted_storage_ops ts_ops = {
 static struct trusted_storage ts = {
     .ops = &ts_ops,
     .size = 0,
-    .max_buf_size = 64,
     .stopped = false,
 };
 
@@ -99,25 +105,40 @@ static int trusted_storage_read_fn(struct trusted_storage* ts,
                                    unsigned long key,
                                    void* out_buf,
                                    size_t len) {
-    void* buf = NULL;
-    size_t size = max(len, ts->max_buf_size);
+    struct trusted_storage_entry* entry = NULL;
+    size_t size;
     int ret = 0;
 
     mutex_lock(&ts->lock);
     if (ts->stopped) {
+        mutex_unlock(&ts->lock);
         ret = TRUSTED_STORAGE_STOPPED;
         goto out;
     }
+    mutex_unlock(&ts->lock);
 
-    buf = radix_tree_lookup(&ts->root, key);
-    if (!buf) {
+    rcu_read_lock();
+
+    entry = radix_tree_lookup(&ts->root, key);
+    if (!entry) {
+        rcu_read_unlock();
         ret = TRUSTED_STORAGE_NOT_FOUND;
         goto out;
     }
-    memcpy(out_buf, buf, size);
+
+    if (len > entry->len) {
+        len >>= 1;
+        size = min(len, entry->len);
+        memcpy(out_buf, entry->buf, size);
+        memcpy(out_buf + size, entry->bak_buf, size);
+    } else {
+        size = min(len, entry->len);
+        memcpy(out_buf, entry->buf, size);
+    }
+
+    rcu_read_unlock();
 
 out:
-    mutex_unlock(&ts->lock);
     return ret;
 }
 
@@ -125,9 +146,9 @@ static int trusted_storage_write_fn(struct trusted_storage* ts,
                                     unsigned long key,
                                     void* in_buf,
                                     size_t len) {
-    void* buf;
+    struct trusted_storage_entry* entry;
     char entry_name[20] = {0};
-    size_t size = max(len, ts->max_buf_size);
+    size_t size;
     int ret = 0;
 
     mutex_lock(&ts->lock);
@@ -136,21 +157,42 @@ static int trusted_storage_write_fn(struct trusted_storage* ts,
         goto out;
     }
 
-    buf = radix_tree_lookup(&ts->root, key);
-    if (buf) {
-        memcpy(buf, in_buf, size);
-        ret = TRUSTED_STORAGE_EXIST;
+    entry = radix_tree_lookup(&ts->root, key);
+    if (entry) {
+        void* buf = NULL;
+
+        /* already exist, update it */
+        buf = entry->bak_buf;
+        entry->bak_buf = entry->buf;
+        entry->buf = buf;
+
+        size = min(len, entry->len);
+        memcpy(entry->buf, in_buf, size);
+
+        synchronize_rcu();
+
+        ret = TRUSTED_STORAGE_OK;
         goto out;
     }
 
-    // buf = kmalloc(size, GFP_ATOMIC);
-    buf = kmalloc(ts->max_buf_size, GFP_ATOMIC);
-    memcpy(buf, in_buf, size);
-    radix_tree_insert(&ts->root, key, buf);
+    size = len;
+    entry = kmalloc(sizeof(*entry) + size * 2, GFP_ATOMIC);
+    if (!entry) {
+        ret = TRUSTED_STORAGE_NO_MEMORY;
+        goto out;
+    }
+    entry->len = size;
+    entry->buf = (void*)entry + sizeof(*entry);
+    entry->bak_buf = entry->buf + size;
+    memcpy(entry->buf, in_buf, size);
+    memset(entry->bak_buf, 0, size);
+    radix_tree_insert(&ts->root, key, entry);
+
+    synchronize_rcu();
 
     /*Creating Proc entry under "/proc/tse/" */
     sprintf(entry_name, "0x%lx", key);
-    proc_create_data(entry_name, 0444, ts->proc_dir, &proc_fops, buf);
+    proc_create_data(entry_name, 0444, ts->proc_dir, &proc_fops, entry);
 
 out:
     mutex_unlock(&ts->lock);
@@ -207,8 +249,10 @@ static ssize_t read_proc(struct file* filp,
                          char __user* buffer,
                          size_t length,
                          loff_t* offset) {
-    u8* buf = PDE_DATA(file_inode(filp));
-    u8 hex_buf[32] = {0};
+    struct trusted_storage_entry* entry = PDE_DATA(file_inode(filp));
+    u8* buf = entry->buf;
+    u8* bak_buf = entry->bak_buf;
+    u8 hex_buf[128] = {0};
 
     if (len) {
         len = 0;
@@ -217,13 +261,14 @@ static ssize_t read_proc(struct file* filp,
         return 0;
     }
 
-    // if (copy_to_user(buffer, buf, ts.max_buf_size)) {
-    //     pr_err(MODULE_NAME " Data Send : Err!\n");
-    // }
+    sprintf(hex_buf,
+            "buffer: %.2x %.2x %.2x %.2x %.2x %.2x %.2x %.2x\n"
+            "backup: %.2x %.2x %.2x %.2x %.2x %.2x %.2x %.2x\n",
+            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+            bak_buf[0], bak_buf[1], bak_buf[2], bak_buf[3], bak_buf[4],
+            bak_buf[5], bak_buf[6], bak_buf[7]);
 
-    sprintf(hex_buf, "%.2x %.2x %.2x %.2x %.2x %.2x %.2x %.2x\n", buf[0],
-            buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]);
-    if (copy_to_user(buffer, hex_buf, strlen(hex_buf))) {
+    if (copy_to_user(buffer, hex_buf, sizeof(hex_buf))) {
         pr_err(MODULE_NAME " Data Send : Err!\n");
     }
 
